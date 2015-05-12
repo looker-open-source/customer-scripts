@@ -1,0 +1,4 @@
+---
+
+- name: looker_restart
+  service: name=looker state=restarted

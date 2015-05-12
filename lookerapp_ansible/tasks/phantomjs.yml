@@ -1,0 +1,20 @@
+---
+
+- name: install prerequisites
+  apt: name=fontconfig state=latest update_cache=yes force=yes
+
+- name: Copy phantomjs install file to root home
+  get_url: url={{ phantomjs_url }}/phantomjs-{{ phantomjs_version }}-linux-{{ ansible_machine }}.tar.bz2 dest=/root/phantomjs-{{ phantomjs_version }}-linux-{{ ansible_machine }}.tar.bz2 mode=0640 owner=root group=root
+
+- name: unpack 
+  command: tar -xjf /root/phantomjs-{{ phantomjs_version }}-linux-{{ ansible_machine }}.tar.bz2 chdir=/usr/local/share creates=/usr/local/share/phantomjs-{{ phantomjs_version }}-linux-{{ ansible_machine }}
+
+- name: link phantomjs dir
+  file: path=/usr/local/share/phantomjs src=/usr/local/share/phantomjs-{{ phantomjs_version }}-linux-{{ ansible_machine }} owner=root group=root state=link
+
+- name: link phantomjs commands
+  file: path=/usr/local/bin/{{ item }} src=/usr/local/share/phantomjs/bin/{{ item }} owner=root group=root state=link
+  with_items:
+    - phantomjs
+
+

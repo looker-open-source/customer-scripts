@@ -1,0 +1,81 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:        looker
+# Required-Start:  $remote_fs $all
+# Required-Stop:
+# Default-Start:   2 3 4 5
+# Default-Stop:
+# Short-Description:    Looker Web Application
+### END INIT INFO
+
+# /etc/init.d/looker: start and stop the Looker Web application
+
+test -x /home/looker/looker/looker || exit 0
+
+umask 022
+
+# Set some defaults
+LOOKERDIR=/home/looker/looker
+LOOKERUSER=looker
+
+USER=`whoami`
+
+if test -f /etc/default/looker; then
+    . /etc/default/looker
+fi
+
+. /lib/lsb/init-functions
+
+pidfile=${LOOKERDIR}/.tmp/looker.pid
+
+if [ -r ${pidfile} ]; then
+  looker_pid=`cat ${pidfile}`
+fi
+
+if [ "$USER" != "${LOOKERUSER}" ]; then
+    if [ "$USER" = "root" ]; then
+      exec su -l ${LOOKERUSER} -c "$0 $@"
+    fi
+    echo "Script must be run from ${LOOKERUSER} or root. You are '${USER}'"
+    exit 1
+fi
+
+export PATH="${PATH:+$PATH:}/usr/sbin:/sbin"
+
+cd ${LOOKERDIR}
+
+start() {
+    log_daemon_msg "Starting Looker Web Application" "looker" || true
+    ./looker start
+}
+
+stop() {
+    log_daemon_msg "Stopping Looker Web Application" "looker" || true
+    ./looker stop
+}
+
+case "$1" in
+  start)
+    start
+	;;
+  stop)
+    stop
+	;;
+
+  restart)
+	log_daemon_msg "Restarting Looker Web Application" "looker" || true
+	./looker restart
+	;;
+
+  status)
+       ./looker status
+       exit $?
+	;;
+
+  *)
+	log_action_msg "Usage: /etc/init.d/looker {start|stop|restart|status}" || true
+	exit 1
+esac
+
+exit 0
+

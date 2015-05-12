@@ -1,0 +1,17 @@
+---
+# Variables here are applicable to looker app deployment
+
+# looker account name
+lookerops: looker
+lookeropsgr: looker
+s3_url: GET_FROM_LOOKER
+deploy_jar: looker-latest.jar
+deploy_dir: /home/looker/looker
+jmx_security_dir: /home/looker/.lookerjmx
+port: 9999
+
+javamem: { "m1.small": "1200m", "m1.medium": "2300m", "m1.large": "4800m", "m3.medium": "2300m", "m3.large": "4800m"}
+
+phantomjs_version: 1.9.8
+phantomjs_url: https://bitbucket.org/ariya/phantomjs/downloads
+

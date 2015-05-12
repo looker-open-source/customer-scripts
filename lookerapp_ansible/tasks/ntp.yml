@@ -1,0 +1,17 @@
+---
+# Common tasks playbook
+
+- name: Ensure NTP is installed
+  apt: pkg=ntp force=yes state=present
+  when: ansible_os_family == "Debian"
+
+- yum: name=ntp state=present
+  when: ansible_os_family == "RedHat"
+
+- name: Ensure NTPD is running
+  service: name=ntp state=running
+  when: ansible_os_family == "Debian"
+
+- service: name=ntpd state=running
+  when: ansible_os_family == "RedHat"
+
