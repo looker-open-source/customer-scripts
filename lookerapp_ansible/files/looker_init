@@ -10,12 +10,12 @@
 
 # /etc/init.d/looker: start and stop the Looker Web application
 
-test -x /home/looker/looker/looker || exit 0
+test -x {{ deploy_dir }}/looker || exit 0
 
 umask 022
 
 # Set some defaults
-LOOKERDIR=/home/looker/looker
+LOOKERDIR={{ deploy_dir }}
 LOOKERUSER=looker
 
 USER=`whoami`
