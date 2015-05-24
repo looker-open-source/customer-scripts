@@ -1,8 +1,8 @@
 ---
 
-- lineinfile: dest=/etc/security/limits.conf state=present line="lookerops     soft     core     unlimited"
-- lineinfile: dest=/etc/security/limits.conf state=present line="lookerops     hard     core     unlimited"
-- lineinfile: dest=/etc/security/limits.conf state=present line="lookerops     soft     nofile    4096"
-- lineinfile: dest=/etc/security/limits.conf state=present line="lookerops     hard     nofile    4096"
+- lineinfile: dest=/etc/security/limits.conf state=present line="{{ lookerops }}     soft     core     unlimited"
+- lineinfile: dest=/etc/security/limits.conf state=present line="{{ lookerops }}     hard     core     unlimited"
+- lineinfile: dest=/etc/security/limits.conf state=present line="{{ lookerops }}     soft     nofile    4096"
+- lineinfile: dest=/etc/security/limits.conf state=present line="{{ lookerops }}     hard     nofile    4096"
 
 

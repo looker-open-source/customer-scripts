@@ -1,4 +1,4 @@
 ---
 
-- cron: user="lookerops" name="zip logs" minute="9" hour="1" job="find $HOME/looker/log -name 'looker.log.????????' -mtime +7 -exec gzip '{}' \; > /dev/null"
-- cron: user="lookerops" name="delete logs" minute="29" hour="1" job="find $HOME/looker/log -name 'looker.log.????????.gz' -mtime +28 -exec rm -f '{}' \; > /dev/null"
+- cron: user="{{ lookerops }}" name="zip logs" minute="9" hour="1" job="find $HOME/looker/log -name 'looker.log.????????' -mtime +7 -exec gzip '{}' \; > /dev/null"
+- cron: user="{{ lookerops }}" name="delete logs" minute="29" hour="1" job="find $HOME/looker/log -name 'looker.log.????????.gz' -mtime +28 -exec rm -f '{}' \; > /dev/null"
