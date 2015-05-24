@@ -20,7 +20,7 @@
     - jmxremote.password
 
 - name: Copy looker startup files
-  copy: src=looker_init dest=/etc/init.d/looker mode=0755 owner=root group=root
+  template: src=looker_init.j2 dest=/etc/init.d/looker mode=0755 owner=root group=root
 
 - template: src=looker.j2 dest={{ deploy_dir }}/looker mode=0750 owner={{ lookerops }} group={{ lookeropsgr }}
 
