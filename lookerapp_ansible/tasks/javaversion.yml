@@ -1,0 +1,21 @@
+---
+
+- name: get version from java
+  command: java -version
+  register: javaout
+  changed_when: false
+
+- set_fact: jvout="{{ javaout.stderr }}"
+
+- set_fact:
+    java_version="java7"
+- set_fact:
+    java_version="java6"
+  when: jvout | match('.*java version\s+"1\.6\.*') 
+- set_fact:
+    java_version="java7"
+  when: jvout | match('.*java version\s+"1\.7\.*') 
+- set_fact:
+    java_version="java8"
+  when: jvout | match('.*java version\s+"1\.8\.*') 
+

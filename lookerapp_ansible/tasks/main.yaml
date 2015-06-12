@@ -2,6 +2,7 @@
 
 - include: ntp.yml
 - include: limits.yml
+- include: javaversion.yml
 - include: phantomjs.yml
 
 - name: Set up looker/.lookerjmx directory
