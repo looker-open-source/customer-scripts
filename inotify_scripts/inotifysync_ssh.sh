@@ -5,7 +5,7 @@
 # needs to be a little less noisy when the process is not running and you
 # try to stop or start
 
-WATCHDIR=/home/lookerops/.ssh
+WATCHDIR=/home/looker/.ssh
 # space seperated server names or ips in quotes
 SYNCDEST="10.0.0.1 10.0.0.2"
 
