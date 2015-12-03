@@ -128,7 +128,7 @@ case "$1" in
         fi
         ;;
   *)
-        java -jar looker.jar $1
+        java -jar looker.jar $*
         ;;
 esac
 
