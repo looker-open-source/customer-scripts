@@ -3,8 +3,6 @@
 cd $HOME/looker 
 # set your java memory- there should be over 1.5G of system memory 
 # left to run the OS
-# set your java memory- there should be over 1.5G of system memory 
-# left to run the OS
 MEM=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
 JM=`expr $MEM - 1500000`
 JAVAMEM="${JM}k"
