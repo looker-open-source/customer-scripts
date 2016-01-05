@@ -1,4 +1,4 @@
-Startup Scripts
+# Startup Scripts
 
 Publicly available scripts for on-premise hosted Looker customer startup.
 
