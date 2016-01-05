@@ -15,7 +15,7 @@ test -x /home/looker/looker || exit 0
 umask 022
 
 # Set some defaults
-LOOKERDIR=/home/looker
+LOOKERDIR=/home/looker/looker
 LOOKERUSER=looker
 
 USER=`whoami`
