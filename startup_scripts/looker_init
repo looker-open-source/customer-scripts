@@ -10,17 +10,26 @@
 
 # /etc/init.d/looker: start and stop the Looker Web application
 
-test -x /home/looker/looker || exit 0
-
-umask 022
 
 # Set some defaults
 LOOKERDIR=/home/looker/looker
 LOOKERUSER=looker
 
+if [ ! -x ${LOOKERDIR} ]; then
+  echo "Looker directory ${LOOKERDIR} does not exist or is not marked exectable."
+  exit 0
+fi
+
+if [ ! -x ${LOOKERDIR}/looker ]; then
+  echo "Looker startup script ${LOOKERDIR}/looker does not exist or is not marked exectable."
+  exit 0
+fi
+
+umask 022
+
 USER=`whoami`
 
-if test -f /etc/default/looker; then
+if [ -f /etc/default/looker ]; then
     . /etc/default/looker
 fi
 
