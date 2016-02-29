@@ -9,6 +9,7 @@ MEM=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
 JM=`expr $MEM - 1500000`
 JAVAMEM="${JM}k"
 
+
 # Extra Java startup args and Looker startup args.  These can also be set in
 # a file named lookerstart.cfg
 JMXARGS="-Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.port=9910 -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.ssl=false -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.local.only=false -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.authenticate=true -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.access.file=${HOME}/.lookerjmx/jmxremote.access -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.password.file=${HOME}/.lookerjmx/jmxremote.password"
@@ -21,6 +22,8 @@ LOOKERARGS=""
 if [ -r ./lookerstart.cfg ]; then
   . ./lookerstart.cfg
 fi
+
+LOOKERPORT=${LOOKERPORT:-"9999"}
 
 start() {
     if [ -e .deploying ]; then
@@ -59,14 +62,14 @@ stop() {
         state="running"
         token=`cat .status_server_token`
         request="control/stop?token=${token}"
-        timeout 20 curl -m 10 -ks https://127.0.0.1:9999/${request} > /dev/null 2>&1
+        timeout 20 curl -m 10 -ks https://127.0.0.1:${LOOKERPORT}/${request} > /dev/null 2>&1
         ECODE=$?
         [ $ECODE -eq 7 ] && state="stopped"
         if [ $ECODE -gt 7 ] ; then
             kill $pid
         fi
         for i in {1..30}; do
-            timeout 20 curl -m 5 -ks https://127.0.0.1:9999/alive > /dev/null 2>&1
+            timeout 20 curl -m 5 -ks https://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
             ECODE=$?
             if [ $ECODE -eq 7 ]; then
               state="stopped"
@@ -117,7 +120,7 @@ case "$1" in
         start
 	;;
   status)
-        curl -ks https://127.0.0.1:9999/alive > /dev/null 2>&1
+        curl -ks https://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
         if [ $? -eq 7 ]; then
           echo "Status:Looker Web Application stopped"
           exit 7
