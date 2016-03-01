@@ -5,10 +5,18 @@ The instructions on this page were tested on an AWS host running CentOS 7.
 ## Enabling Looker to start on boot
 To enable Looker to start on boot for a host which uses systemd, perform the following steps as root:
 
-First, save the looker.service file from this repository as /etc/systemd/system/looker.service
+First, save the [looker.service](https://raw.githubusercontent.com/looker/customer-scripts/master/startup_scripts/systemd/looker.service) file from this repository as /etc/systemd/system/looker.service
 
 You may need to customize the looker.service file if you are using a user other than "looker", or if
 Looker is not installed in /home/looker/looker.
+
+Second, adjust the file permissions:
+
+```
+chmod 664 /etc/systemd/system/looker.service
+```
+
+
 
 Lastly, run the following commmands:
 
