@@ -84,7 +84,7 @@ case "$1" in
     stop
     ;;
   restart)
-    echo "Restarting Looker Web Application" "looker"
+    echo "Restarting Looker Sync Application" "looker"
     stop
     sleep 3
     start
