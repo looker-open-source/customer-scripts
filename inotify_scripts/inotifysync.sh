@@ -1,6 +1,6 @@
 #!/bin/bash
 # inotifysync.sh
-# requires inotifytools package
+# requires inotify-tools package
 #
 # needs to be a little less noisy when the process is not running and you
 # try to stop or start
