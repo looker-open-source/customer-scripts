@@ -84,7 +84,7 @@ case "$1" in
     stop
     ;;
   restart)
-    echo "Restarting Looker Web Application" "looker"
+    echo "Restarting Looker restart message" "looker"
     stop
     sleep 3
     start
