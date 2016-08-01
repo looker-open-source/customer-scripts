@@ -39,7 +39,7 @@ start() {
     fixcrypt
     java \
   -XX:+CMSClassUnloadingEnabled -XX:+UseConcMarkSweepGC \
-  -XX:MaxPermSize=128M -Xms$JAVAMEM \
+  -XX:MaxPermSize=256M -Xms$JAVAMEM \
   -Xmx$JAVAMEM \
   -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCTimeStamps \
   -Xloggc:/tmp/gc.log  ${JAVAARGS} \
