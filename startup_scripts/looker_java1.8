@@ -20,6 +20,17 @@ if [ -r ./lookerstart.cfg ]; then
   . ./lookerstart.cfg
 fi
 
+# check if --no-ssl is specified in LOOKERARGS and set protocol accordingly
+PROTOCOL=""
+
+echo "${LOOKERARGS}" | grep -q "\-\-no\-ssl"
+if [ $? -eq 0 ] 
+then
+	PROTOCOL='http'
+else
+	PROTOCOL='https'
+fi
+
 start() {
     if [ -e .deploying ]; then
         echo "Startup suppressed: ${PWD}/.deploying file exists.  Remove .deploying file to allow startup"
@@ -57,14 +68,14 @@ stop() {
         state="running"
         token=`cat .status_server_token`
         request="control/stop?token=${token}"
-        timeout 20 curl -m 10 -ks https://127.0.0.1:9999/${request} > /dev/null 2>&1
+        timeout 20 curl -m 10 -ks ${PROTOCOL}://127.0.0.1:9999/${request} > /dev/null 2>&1
         ECODE=$?
         [ $ECODE -eq 7 ] && state="stopped"
         if [ $ECODE -gt 7 ] ; then
             kill $pid
         fi
         for i in {1..30}; do
-            timeout 20 curl -m 5 -ks https://127.0.0.1:9999/alive > /dev/null 2>&1
+            timeout 20 curl -m 5 -ks ${PROTOCOL}://127.0.0.1:9999/alive > /dev/null 2>&1
             ECODE=$?
             if [ $ECODE -eq 7 ]; then
               state="stopped"
@@ -115,7 +126,7 @@ case "$1" in
         start
 	;;
   status)
-        curl -ks https://127.0.0.1:9999/alive > /dev/null 2>&1
+        curl -ks ${PROTOCOL}://127.0.0.1:9999/alive > /dev/null 2>&1
         if [ $? -eq 7 ]; then
           echo "Status:Looker Web Application stopped"
           exit 7
