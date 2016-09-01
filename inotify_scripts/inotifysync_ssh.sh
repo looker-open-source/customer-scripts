@@ -33,15 +33,15 @@ watchloop() {
 killtree() {
     local _pid=$1
     local _sig=${2:-9}
-    kill -stop ${_pid} 2>&1 >> /dev/null # needed to stop quickly forking parent from producing children between child killing and parent killing
+    kill -stop ${_pid} > /dev/null 2>&1 # needed to stop quickly forking parent from producing children between child killing and parent killing
     for _child in $(ps -o pid --no-headers --ppid ${_pid}); do
         killtree ${_child} ${_sig}
     done
-    kill -${_sig} ${_pid} 2>&1 >> /dev/null
+    kill -${_sig} ${_pid} > /dev/null 2>&1
 }
 
 start() {
-    if [ -e ${PIDFILE} ] && kill -0 `cat ${PIDFILE}` 2>&1 >> /dev/null ; then
+    if [ -e ${PIDFILE} ] && kill -0 `cat ${PIDFILE}` > /dev/null 2>&1 ; then
         echo "inotifysync is already running"
         exit 1
     fi
@@ -56,10 +56,10 @@ start() {
 }
 
 stop() {
-  if [ -e ${PIDFILE} ] && kill -0 `cat ${PIDFILE}` 2>&1 >> /dev/null ; then
+  if [ -e ${PIDFILE} ] && kill -0 `cat ${PIDFILE}` > /dev/null 2>&1 ; then
     killtree `cat ${PIDFILE}`
-    kill `cat ${PIDFILE}` 2>&1 >> /dev/null
-    if kill -0 `cat ${PIDFILE}` 2>&1 >> /dev/null ; then
+    kill `cat ${PIDFILE}` > /dev/null 2>&1
+    if kill -0 `cat ${PIDFILE}` > /dev/null 2>&1 ; then
       kill -9 `cat ${PIDFILE}`
     fi
     echo 'inotifysync stopped'
@@ -73,11 +73,11 @@ case "$1" in
     start
     ;;
   start)
-    if [ -e ${PIDFILE} ] && kill -0 `cat ${PIDFILE}` 2>&1 >> /dev/null ; then
+    if [ -e ${PIDFILE} ] && kill -0 `cat ${PIDFILE}` > /dev/null 2>&1 ; then
       echo "inotifysync is already running"
       exit 1
     else
-      $0 startbg 2>&1 >> /dev/null &
+      $0 startbg > /dev/null 2>&1 &
     fi
     ;;
   stop)
@@ -90,7 +90,7 @@ case "$1" in
     start
     ;;
   status)
-    if [ -e ${PIDFILE} ] && kill -0 `cat ${PIDFILE}` 2>&1 >> /dev/null ; then
+    if [ -e ${PIDFILE} ] && kill -0 `cat ${PIDFILE}` > /dev/null 2>&1 ; then
       echo "Status:inotifysync running"
       exit 0
     fi
