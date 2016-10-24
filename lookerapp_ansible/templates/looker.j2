@@ -40,12 +40,7 @@ start() {
 
     fixcrypt
     java \
-{% if java_version == "java7" %}
-  -XX:+CMSClassUnloadingEnabled -XX:+UseConcMarkSweepGC -XX:MaxPermSize=128M \
-{% endif %}
-{% if java_version == "java8" %}
    -XX:+UseG1GC -XX:MaxGCPauseMillis=2000 \
-{% endif %}
   -Xms$JAVAMEM -Xmx$JAVAMEM \
   -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCTimeStamps \
   -Xloggc:/tmp/gc.log  ${JAVAARGS} \

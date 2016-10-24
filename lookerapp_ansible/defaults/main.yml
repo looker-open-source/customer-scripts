@@ -12,6 +12,6 @@ port: 9999
 
 javamem: { "m1.small": "1200m", "m1.medium": "2300m", "m1.large": "4800m", "m3.medium": "2300m", "m3.large": "4800m"}
 
-phantomjs_version: 1.9.8
+phantomjs_version: 2.1.1
 phantomjs_url: https://bitbucket.org/ariya/phantomjs/downloads
 

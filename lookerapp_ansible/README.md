@@ -4,7 +4,7 @@ This role will likely only work on Ubuntu 12+
 
 Prerequisites:
 
-* Oracle Java 1.7+
+* Oracle Java 1.8
 * A looker user with home dir of /home/looker
 
 Vars you need to set:
