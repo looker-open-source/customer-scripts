@@ -11,6 +11,10 @@ Publicly available scripts for on-premise hosted Looker customer startup.
 
 ### To set Looker to start on boot for an Ubuntu host:
 
+#### 16.04 LTS and later
+16.04 LTS and later use `systemd` to manage services. Please follow the instructions in [systemd](systemd).
+
+#### For versions before 16.04 LTS
 * Download a copy of looker_init to your Looker server.
 * As root, save looker_init to /etc/init.d/looker
 * As root, edit /etc/init.d/looker. Near the top of the script, change the values of LOOKERDIR and LOOKERUSER if you are using a non-default location or user. 
