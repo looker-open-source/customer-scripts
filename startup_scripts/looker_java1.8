@@ -13,6 +13,7 @@ cd $HOME/looker
 MEM=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
 JM=`expr $MEM \* 6 / 10`
 JAVAMEM="${JM}k"
+METAMEM="800m"
 
 # Extra Java startup args and Looker startup args.  These can also be set in
 # a file named lookerstart.cfg
@@ -56,7 +57,7 @@ start() {
 
     fixcrypt
     java \
-  -XX:+UseG1GC -XX:MaxGCPauseMillis=2000 \
+  -XX:+UseG1GC -XX:MaxGCPauseMillis=2000 -XX:MaxMetaspaceSize=$METAMEM \
   -Xms$JAVAMEM -Xmx$JAVAMEM \
   -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCTimeStamps \
   -Xloggc:/tmp/gc.log  ${JAVAARGS} \
