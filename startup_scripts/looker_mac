@@ -1,5 +1,11 @@
 #!/bin/sh
 
+JAVA_VER=$(java -version 2>&1 | sed 's/java version "\(.*\)\.\(.*\)\..*"/\1\2/; 1q')
+if [ "$JAVA_VER" -le 17 ]; then
+  echo "The Java version installed on this host is too old. Please upgrade to the latest version of Java 8."
+  exit 1
+fi
+
 HOSTTYPE=`uname -s`
 
 cd $HOME/looker 
@@ -20,6 +26,7 @@ case $HOSTTYPE in
 esac
 JM=`expr $MEM \* 6 / 10`
 JAVAMEM="${JM}k"
+METAMEM="800m"
 
 # Extra Java startup args and Looker startup args.  These can also be set in
 # a file named lookerstart.cfg
@@ -32,6 +39,18 @@ LOOKERARGS=""
 # check for a lookerstart.cfg file to set JAVAARGS and LOOKERARGS
 if [ -r ./lookerstart.cfg ]; then
   . ./lookerstart.cfg
+fi
+
+# check if --no-ssl is specified in LOOKERARGS and set protocol accordingly
+PROTOCOL=""
+LOOKERPORT=${LOOKERPORT:-"9999"}
+
+echo "${LOOKERARGS}" | grep -q "\-\-no\-ssl"
+if [ $? -eq 0 ] 
+then
+	PROTOCOL='http'
+else
+	PROTOCOL='https'
 fi
 
 start() {
@@ -62,9 +81,8 @@ start() {
         ;;
     esac
     java \
-  -XX:+CMSClassUnloadingEnabled -XX:+UseConcMarkSweepGC \
-  -XX:MaxPermSize=128M -Xms$JAVAMEM \
-  -Xmx$JAVAMEM \
+  -XX:+UseG1GC -XX:MaxGCPauseMillis=2000 -XX:MaxMetaspaceSize=$METAMEM \
+  -Xms$JAVAMEM -Xmx$JAVAMEM \
   -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCTimeStamps \
   -Xloggc:/tmp/gc.log  ${JAVAARGS} \
   -jar looker.jar start ${LOOKERARGS}
@@ -84,10 +102,10 @@ stop() {
         request="control/stop?token=${token}"
         case $HOSTTYPE in
           Darwin)
-            curl -m 10 -ks https://127.0.0.1:9999/${request} > /dev/null 2>&1
+            curl -m 10 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/${request} > /dev/null 2>&1
             ;;
           Linux)
-            timeout 20 curl -m 10 -ks https://127.0.0.1:9999/${request} > /dev/null 2>&1
+            timeout 20 curl -m 10 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/${request} > /dev/null 2>&1
             ;;
           *)
             echo "Unknown host type: ${HOSTTYPE}"
@@ -102,10 +120,10 @@ stop() {
         for i in {1..30}; do
             case $HOSTTYPE in
               Darwin)
-                curl -m 5 -ks https://127.0.0.1:9999/alive > /dev/null 2>&1
+                curl -m 5 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
                 ;;
               Linux)
-                timeout 20 curl -m 5 -ks https://127.0.0.1:9999/alive > /dev/null 2>&1
+                timeout 20 curl -m 5 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
                 ;;
               *)
                 echo "Unknown host type: ${HOSTTYPE}"
@@ -173,7 +191,7 @@ case "$1" in
         start
 	;;
   status)
-        curl -ks https://127.0.0.1:9999/alive > /dev/null 2>&1
+        curl -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
         if [ $? -eq 7 ]; then
           echo "Status:Looker Web Application stopped"
           exit 7
