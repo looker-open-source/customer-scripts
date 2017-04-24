@@ -43,6 +43,7 @@ fi
 
 # check if --no-ssl is specified in LOOKERARGS and set protocol accordingly
 PROTOCOL=""
+LOOKERPORT=${LOOKERPORT:-"9999"}
 
 echo "${LOOKERARGS}" | grep -q "\-\-no\-ssl"
 if [ $? -eq 0 ] 
@@ -101,10 +102,10 @@ stop() {
         request="control/stop?token=${token}"
         case $HOSTTYPE in
           Darwin)
-            curl -m 10 -ks https://127.0.0.1:9999/${request} > /dev/null 2>&1
+            curl -m 10 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/${request} > /dev/null 2>&1
             ;;
           Linux)
-            timeout 20 curl -m 10 -ks https://127.0.0.1:9999/${request} > /dev/null 2>&1
+            timeout 20 curl -m 10 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/${request} > /dev/null 2>&1
             ;;
           *)
             echo "Unknown host type: ${HOSTTYPE}"
@@ -119,10 +120,10 @@ stop() {
         for i in {1..30}; do
             case $HOSTTYPE in
               Darwin)
-                curl -m 5 -ks https://127.0.0.1:9999/alive > /dev/null 2>&1
+                curl -m 5 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
                 ;;
               Linux)
-                timeout 20 curl -m 5 -ks https://127.0.0.1:9999/alive > /dev/null 2>&1
+                timeout 20 curl -m 5 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
                 ;;
               *)
                 echo "Unknown host type: ${HOSTTYPE}"
@@ -190,7 +191,7 @@ case "$1" in
         start
 	;;
   status)
-        curl -ks ${PROTOCOL}://127.0.0.1:9999/alive > /dev/null 2>&1
+        curl -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
         if [ $? -eq 7 ]; then
           echo "Status:Looker Web Application stopped"
           exit 7
