@@ -16,7 +16,17 @@ Second, adjust the file permissions:
 chmod 664 /etc/systemd/system/looker.service
 ```
 
+Force Looker to run in the foreground:
 
+In either the /home/looker/looker/looker startup script or in /home/looker/looker/lookerstart.cfg, a file you would need to create, set the --no-daemonize flag in the LOOKERARGS environment variable
+
+```
+LOOKERARGS="--no-daemonize"
+```
+or, if you are running a cluster, or have other custom args, something like
+```
+LOOKERARGS="--no-daemonize -d looker-db.yml --clustered -H 10.10.10.10 --shared-storage-dir	/path/to/mounted/shared/storage"
+```
 
 Lastly, run the following commmands:
 
