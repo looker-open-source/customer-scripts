@@ -5,7 +5,7 @@ After=network.target
 [Service]
 ExecStart=/home/looker/looker/looker start
 ExecStop=/home/looker/looker/looker stop
-Type=forking
+Type=simple
 PIDFile=/home/looker/looker/.tmp/looker.pid
 User=looker
 WorkingDirectory=/home/looker/looker
