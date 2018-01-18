@@ -1,15 +1,24 @@
 #!/bin/sh
-# This is an example for use on a Looker connecting to remote database via tunnelserver
 # Template for tunnel startup
 # Set the user, key, server and port forward, then copy to ~/looker/tunnel,
 # set to mode 750
 #
+# When using more than one autossh config, eg for more than one ssh server endpoint
+# these startup scripts can be named tunnel_1, tunnel_2, etc. Adjust the pidfile to
+# avoid collisions by naming them autossh[12].pid A wrapper around all of the tunnel
+# startups can be created passing $1 to each for the start|stop arg
+#
+# For multiple db endpoints reachable from the same tunnel server, it's convenient
+# to simply add an additional -L <localport>:<dbhost>:<dbport>
+#
+# More than one -i <key> can be supplied during key-rotation operations to ensure
+# uptime
+#
 #
 
 cd $HOME/looker
-export AUTOSSH_PIDFILE=.autossh.pid
-DAEMON=autossh
-
+export AUTOSSH_PIDFILE=$HOME/looker/.autossh.pid
+unset SSH_AUTH_SOCK
 
 start() {
     autossh -M0 -f -N -T \
@@ -21,7 +30,7 @@ start() {
 
 pidtest() {
   if [ -e $AUTOSSH_PIDFILE ]; then
-     PSLINE=`ps --no-headers -p $( cat $AUTOSSH_PIDFILE ) | grep $DAEMON`
+     PSLINE=`ps --no-headers -p $( cat $AUTOSSH_PIDFILE ) | grep autossh`
      if [ -z "$PSLINE" ]; then
          retval=1
      else
