@@ -1,0 +1,97 @@
+#!/bin/sh
+# Template for tunnel startup
+# Set the user, key, server and port forward, then copy to ~/looker/tunnel,
+# set to mode 750
+#
+# When using more than one autossh config, eg for more than one ssh server endpoint
+# these startup scripts can be named tunnel_1, tunnel_2, etc. Adjust the pidfile to
+# avoid collisions by naming them autossh[12].pid A wrapper around all of the tunnel
+# startups can be created passing $1 to each for the start|stop arg
+#
+# For multiple db endpoints reachable from the same tunnel server, it's convenient
+# to simply add an additional -L <localport>:<dbhost>:<dbport>
+#
+# More than one -i <key> can be supplied during key-rotation operations to ensure
+# uptime
+#
+#
+
+cd $HOME/looker
+export AUTOSSH_PIDFILE=$HOME/looker/.autossh.pid
+unset SSH_AUTH_SOCK
+
+start() {
+    autossh -M0 -f -N -T \
+    -L 1234:mydb:1234 \
+    -i myuserkey -o TCPKeepAlive=yes \
+    -o ServerAliveInterval=30 \
+    looker@tunnelserver
+}
+
+pidtest() {
+  if [ -e $AUTOSSH_PIDFILE ]; then
+     PSLINE=`ps --no-headers -p $( cat $AUTOSSH_PIDFILE ) | grep autossh`
+     if [ -z "$PSLINE" ]; then
+         retval=1
+     else
+         retval=0
+     fi
+  else
+     retval=3
+  fi
+  return "$retval"
+}
+
+case $1 in
+ start)
+   # Checked the PID file exists and check the actual status of process
+   pidtest
+   status=$?
+   # If the status is SUCCESS then don't need to start again.
+   if [ $status = "0" ]; then
+     echo "Tunnel already running"
+     exit 0
+   fi
+   # Start the daemon.
+   echo "Starting Tunnel"
+   start
+  ;;
+ stop)
+  # Stop the daemon.
+   pidtest
+   status=$?
+   if [ "$status" = 0 ]; then
+     kill $( cat $AUTOSSH_PIDFILE )
+   else
+     echo "Tunnel is not running"
+   fi
+  ;;
+ restart)
+  # Restart the daemon.
+  $0 stop && sleep 2 && $0 start
+  ;;
+ status)
+  # Check the status of the process.
+    pidtest
+    status=$?
+    if [ "$status" = 0 ]; then
+      echo "Tunnel is running"
+      exit 0
+    else
+      echo "Tunnel is not running"
+      exit $status
+    fi
+  ;;
+ reload)
+  # Reload the process. Basically sending some signal to a daemon to reload
+  # it configurations.
+  if [ -e $AUTOSSH_PIDFILE ]; then
+      kill -usr1 $( cat $AUTOSSH_PIDFILE )
+  fi
+  ;;
+ *)
+  # For invalid arguments, print the usage message.
+  echo "Usage: $0 {start|stop|restart|reload|status}"
+  exit 2
+  ;;
+esac
