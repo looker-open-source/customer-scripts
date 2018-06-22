@@ -1,4 +1,4 @@
-Systemd replaces the SysV init system. It is used with RHEL 7, CentOS 7, and others. 
+Systemd replaces the SysV init system. It is used with RHEL 7, CentOS 7, and others.
 
 The instructions on this page were tested on an AWS host running CentOS 7.  
 
@@ -27,6 +27,9 @@ or, if you are running a cluster, or have other custom args, something like
 ```
 LOOKERARGS="--no-daemonize -d looker-db.yml --clustered -H 10.10.10.10 --shared-storage-dir	/path/to/mounted/shared/storage"
 ```
+
+The --no-daemonize flag is also useful if you plan on using supervisord to manage looker,
+but make sure you uncomment out the "trap" command in looker's startup script.
 
 Lastly, run the following commmands:
 
