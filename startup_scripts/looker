@@ -7,8 +7,15 @@ if [ "$JAVA_VER" -le 17 ]; then
   exit 1
 fi
 
-cd $HOME/looker 
-# set your java memory- there should be over 1.5G of system memory 
+cd $HOME/looker
+
+# If using --no-daemonize option in lookerstart.cfg and if you're using supervisord to manage looker,
+# you should uncomment out this line.  It makes supervisord stop this shell script on a "supervisorctl stop" command,
+# thus causing the stop() function to be called.  See the supervisord folder for an example of what the
+# supervisord config looks like.
+#trap stop EXIT
+
+# set your java memory- there should be over 1.5G of system memory
 # left to run the OS
 MEM=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
 JM=`expr $MEM \* 6 / 10`
@@ -32,7 +39,7 @@ fi
 PROTOCOL=""
 
 echo "${LOOKERARGS}" | grep -q "\-\-no\-ssl"
-if [ $? -eq 0 ] 
+if [ $? -eq 0 ]
 then
 	PROTOCOL='http'
 else
@@ -51,7 +58,7 @@ start() {
         echo "Startup suppressed: ${LOCKFILE} contains running pid, startup script is already running"
         exit 1
     fi
-    
+
     # make sure the lockfile is removed when we exit and then claim it
     trap "rm -f ${LOCKFILE}; exit" INT TERM EXIT
     echo $$ > ${LOCKFILE}
