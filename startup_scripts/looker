@@ -1,7 +1,7 @@
 #!/bin/sh
 
-# Make sure we're running Java 1.8
-JAVA_VER=$(java -version 2>&1 | sed 's/openjdk version "\(.*\)\.\(.*\)\..*"/\1\2/; 1q')
+# Make sure we're running Java >= 1.8
+JAVA_VER=$(java -version 2>&1 | head -n 1 | cut -f 2 -d '"' | cut -f 1,2 -d . | tr -d .)
 if [ "$JAVA_VER" -le 17 ]; then
   echo "The Java version installed on this host is too old. Please upgrade to the latest version of Java 8."
   exit 1
