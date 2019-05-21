@@ -1,12 +1,5 @@
 #!/bin/sh
 
-# Make sure we're running Java 1.8
-JAVA_VER=$(java -version 2>&1 | sed 's/openjdk version "\(.*\)\.\(.*\)\..*"/\1\2/; 1q')
-if [ "$JAVA_VER" -le 17 ]; then
-  echo "The Java version installed on this host is too old. Please upgrade to the latest version of Java 8."
-  exit 1
-fi
-
 cd $HOME/looker 
 # set your java memory- there should be over 1.5G of system memory 
 # left to run the OS
