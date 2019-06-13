@@ -11,6 +11,6 @@ Prerequisites:
 
 Vars you need to set:
 
-Valie email
-Valid license
-Looker Release
+Valid email
+, Valid license
+, Looker Release
