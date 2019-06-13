@@ -5,14 +5,24 @@
 - include: javaversion.yml
 - include: phantomjs.yml
 
+- set_fact:
+    email: <YOUR_EMAIL>
+    license: <YOUR_LICENSE>
+    latest: <JAR_TO_DOWNLOAD>
+
 - name: Set up looker/.lookerjmx directory
   file: state=directory path={{ jmx_security_dir }} mode=0700 owner={{ lookerops }} group={{ lookeropsgr }}
 
 - name: Set up looker/looker directory
   file: state=directory path={{ deploy_dir }} mode=0750 owner={{ lookerops }} group={{ lookeropsgr }}
 
-- name: Copy jar file to looker home
-  get_url: url={{ s3_url }}/{{ deploy_jar }} dest={{ deploy_dir }}/looker.jar mode=0640 owner={{ lookerops }} group={{ lookeropsgr }}
+- name: Copy validated jar download url
+  shell: |
+    wget -q -O- --post-data="{\"lic\": \"{{ license }}\", \"email\": \"{{ email }}\", \"latest\":\"{{ latest }}\"}" --header=Content-Type:application/json "https://apidownload.looker.com/download" > ~/response.txt
+
+- name: Parse response and download jar
+  shell: |
+    wget -O "looker-latest.jar" "$(cat ~/response.txt | jq .url -r)"
 
 - name: Copy jmx security files to looker home
   copy: src={{ item }} dest={{ jmx_security_dir }}/{{ item }} owner={{ lookerops }} group={{ lookeropsgr }} mode=0400

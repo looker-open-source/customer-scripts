@@ -6,7 +6,11 @@ Prerequisites:
 
 * Oracle Java 1.8
 * A looker user with home dir of /home/looker
+* [jq](https://stedolan.github.io/jq/)
+* Jar download example from our [docs](https://docs.looker.com/setup-and-management/on-prem-install/download-looker-jar#calling_the_api).
 
 Vars you need to set:
 
-s3_url - Get this from Looker support.
+Valie email
+Valid license
+Looker Release
