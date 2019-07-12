@@ -6,6 +6,7 @@ lookerops: looker
 lookeropsgr: looker
 s3_url: GET_FROM_LOOKER
 deploy_jar: looker-latest.jar
+deploy_oss_jar: looker-dependencies-latest.jar
 deploy_dir: /home/looker/looker
 jmx_security_dir: /home/looker/.lookerjmx
 port: 9999
