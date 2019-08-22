@@ -24,6 +24,10 @@
   shell: |
     wget -O "looker-latest.jar" "$(cat ~/response.txt | jq .url -r)"
 
+- name: Parse response and download dependency jar
+  shell: |
+    wget -O "looker-dependencies-latest.jar" "$(cat ~/response.txt | jq .url -r)"
+
 - name: Copy jmx security files to looker home
   copy: src={{ item }} dest={{ jmx_security_dir }}/{{ item }} owner={{ lookerops }} group={{ lookeropsgr }} mode=0400
   with_items:
