@@ -1,0 +1,157 @@
+#!/bin/sh
+
+#
+# This is the startup script for Looker using OpenJDK11.  Looker supports
+# OpenJDK11 starting with the 7.16 release
+#
+
+JAVA_VER=$(java -version 2>&1 | head -1 | cut -d'"' -f2 | sed '/^1\./s///' | cut -d'.' -f1)
+if [ "$JAVA_VER" -ne 11 ]; then
+  WHERE=`which java`
+  echo "This script runs with OpenJDK11, your executable $WHERE has Java major version $JAVA_VER"
+  exit 1
+fi
+
+cd $HOME/looker 
+# set your java memory- there should be over 1.5G of system memory 
+# left to run the OS
+MEM=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
+JM=`expr $MEM \* 6 / 10`
+JAVAMEM="${JM}k"
+METAMEM="800m"
+
+# Extra Java startup args and Looker startup args.  These can also be set in
+# a file named lookerstart.cfg
+JMXARGS="-Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.port=9910 -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.ssl=false -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.local.only=false -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.authenticate=true -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.access.file=${HOME}/.lookerjmx/jmxremote.access -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.password.file=${HOME}/.lookerjmx/jmxremote.password"
+
+# to set up JMX monitoring, add JMXARGS to JAVAARGS
+JAVAARGS=""
+LOOKERARGS=""
+
+# check for a lookerstart.cfg file to set JAVAARGS and LOOKERARGS
+if [ -r ./lookerstart.cfg ]; then
+  . ./lookerstart.cfg
+fi
+
+# check if --no-ssl is specified in LOOKERARGS and set protocol accordingly
+PROTOCOL=""
+
+echo "${LOOKERARGS}" | grep -q "\-\-no\-ssl"
+if [ $? -eq 0 ] 
+then
+	PROTOCOL='http'
+else
+	PROTOCOL='https'
+fi
+LOOKERPORT=${LOOKERPORT:-"9999"}
+
+start() {
+    if [ -e .deploying ]; then
+        echo "Startup suppressed: ${PWD}/.deploying file exists.  Remove .deploying file to allow startup"
+        exit 1
+    fi
+
+    LOCKFILE=.starting
+    if [ -e ${LOCKFILE} ] && kill -0 `cat ${LOCKFILE}`; then
+        echo "Startup suppressed: ${LOCKFILE} contains running pid, startup script is already running"
+        exit 1
+    fi
+    
+    # make sure the lockfile is removed when we exit and then claim it
+    trap "rm -f ${LOCKFILE}; exit" INT TERM EXIT
+    echo $$ > ${LOCKFILE}
+
+    fixcrypt
+    java \
+  -XX:+UseG1GC -XX:MaxGCPauseMillis=2000 -XX:MaxMetaspaceSize=$METAMEM \
+  -Xms$JAVAMEM -Xmx$JAVAMEM \
+  -Xlog:gc*,gc+ref=debug,gc+heap=debug,gc+age=debug:file=/tmp/gc-%p-%t.log:tags,uptime,time,level:filecount=7,filesize=10m \
+  ${JAVAARGS} \
+  -jar looker.jar start ${LOOKERARGS}
+
+    if [ -x ./tunnel ]; then
+       ./tunnel start
+    fi
+
+    rm -f ${LOCKFILE}
+}
+
+stop() {
+    pid=`cat .tmp/looker.pid`
+    if [ -f .status_server_token ] && [ -x /usr/bin/curl ]; then
+        state="running"
+        token=`cat .status_server_token`
+        request="control/stop?token=${token}"
+        timeout 20 curl -m 10 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/${request} > /dev/null 2>&1
+        ECODE=$?
+        [ $ECODE -eq 7 ] && state="stopped"
+        if [ $ECODE -gt 7 ] ; then
+            kill $pid
+        fi
+        for i in {1..30}; do
+            timeout 20 curl -m 5 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
+            ECODE=$?
+            if [ $ECODE -eq 7 ]; then
+              state="stopped"
+              break
+            fi
+            if [ $ECODE -gt 7 ] ; then
+                kill -9 $pid
+            fi
+            sleep 1
+        done
+        if [ "${state}" = "running" ]; then
+            echo "Force Stop Looker Web Application"
+            kill $pid
+            kill -0 $pid && kill -9 $pid
+        fi
+    else
+        timeout 20 java -jar looker.jar stop
+        if [ $? -ne 0 ]; then
+            kill -9 $pid
+        fi
+    fi
+}
+
+fixcrypt() {
+    CRYPTEXIST=`/sbin/ldconfig -p | grep -c '\slibcrypt.so\s'`
+
+    if [ $CRYPTEXIST -eq 0 ]; then
+        if [ ! -d .tmp ]; then
+            mkdir .tmp
+        fi
+        CRYPTLN=`/sbin/ldconfig -p | grep '\slibcrypt\.so\.[[:digit:]]' | awk '{print $(NF)}'`
+        ln -s -f $CRYPTLN `pwd`/.tmp/libcrypt.so
+        export LD_LIBRARY_PATH=`pwd`/.tmp/:$LD_LIBRARY_PATH
+    fi
+}
+
+case "$1" in
+  start)
+    start
+	;;
+  stop)
+    stop
+	;;
+  restart)
+	echo "Restarting Looker Web Application" "looker"
+        stop
+        sleep 3
+        start
+	;;
+  status)
+        curl -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
+        if [ $? -eq 7 ]; then
+          echo "Status:Looker Web Application stopped"
+          exit 7
+        else
+          echo "Status:Looker Web Application running"
+          exit 0
+        fi
+        ;;
+  *)
+        java -jar looker.jar $*
+        ;;
+esac
+
+exit 0
