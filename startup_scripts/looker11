@@ -24,6 +24,10 @@ METAMEM="800m"
 # a file named lookerstart.cfg
 JMXARGS="-Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.port=9910 -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.ssl=false -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.local.only=false -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.authenticate=true -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.access.file=${HOME}/.lookerjmx/jmxremote.access -Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote.password.file=${HOME}/.lookerjmx/jmxremote.password"
 
+# Starting with JDK9 some reflective accesses log warning messages, these java
+# args increase module visibilty and so supress the output
+REFLECTIVE_ACCESS_ARGS="--add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.math=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED --add-opens java.base/java.util.concurrent=ALL-UNNAMED --add-opens java.base/java.net=ALL-UNNAMED --add-opens java.base/java.text=ALL-UNNAMED"
+
 # to set up JMX monitoring, add JMXARGS to JAVAARGS
 JAVAARGS=""
 LOOKERARGS=""
@@ -66,6 +70,7 @@ start() {
   -XX:+UseG1GC -XX:MaxGCPauseMillis=2000 -XX:MaxMetaspaceSize=$METAMEM \
   -Xms$JAVAMEM -Xmx$JAVAMEM \
   -Xlog:gc*,gc+ref=debug,gc+heap=debug,gc+age=debug:file=/tmp/gc-%p-%t.log:tags,uptime,time,level:filecount=7,filesize=10m \
+  ${REFLECTIVE_ACCESS_ARGS} \
   ${JAVAARGS} \
   -jar looker.jar start ${LOOKERARGS}
 
