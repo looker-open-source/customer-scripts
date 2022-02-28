@@ -30,7 +30,7 @@ REFLECTIVE_ACCESS_ARGS="--add-opens java.base/java.lang=ALL-UNNAMED --add-opens 
 
 # to set up JMX monitoring, add JMXARGS to JAVAARGS
 JAVAARGS=""
-LOOKERARGS=""
+LOOKERARGS="--force-gcm-encryption"
 
 # check for a lookerstart.cfg file to set JAVAARGS and LOOKERARGS
 if [ -r ./lookerstart.cfg ]; then

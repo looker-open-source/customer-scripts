@@ -1,6 +1,6 @@
 # Startup Scripts
 
-Publicly available scripts for on-premise hosted Looker customer startup.
+Publicly available scripts for on-premise hosted Looker customer startup. See the [public documentation](https://docs.looker.com/setup-and-management/on-prem-install/looker-startup-options) for startup options.
 
 * looker: Startup script for looker running under Java 1.8.  Should be in the /home/looker/looker directory with the looker.jar file, and it should be named looker. The full path to the file will commonly be /home/looker/looker/looker. Use this script for all current versions of Looker.
 * looker11: Startup script for looker running with OpenJDK11.  Should be in the /home/looker/looker directory with the looker.jar file, and it *should be named looker*. The full path to the file will commonly be /home/looker/looker/looker. Several things depend on this script being renamed from looker11->looker, so make sure to do this.

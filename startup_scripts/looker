@@ -14,7 +14,7 @@ JMXARGS="-Dcom.sun.akuma.jvmarg.com.sun.management.jmxremote -Dcom.sun.akuma.jvm
 
 # to set up JMX monitoring, add JMXARGS to JAVAARGS
 JAVAARGS=""
-LOOKERARGS=""
+LOOKERARGS="--force-gcm-encryption"
 
 # check for a lookerstart.cfg file to set JAVAARGS and LOOKERARGS
 if [ -r ./lookerstart.cfg ]; then
