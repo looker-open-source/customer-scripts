@@ -24,7 +24,7 @@ fi
 # check if --no-ssl is specified in LOOKERARGS and set protocol accordingly
 PROTOCOL=""
 
-echo "${LOOKERARGS}" | grep -q "\-\-no\-ssl"
+echo "${LOOKERARGS}" | grep -e "\-\-no\-ssl" -e "\-\-ssl-provided-externally-by"
 if [ $? -eq 0 ] 
 then
 	PROTOCOL='http'
