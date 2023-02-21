@@ -16,9 +16,9 @@ cd $HOME/looker
 # set your java memory- there should be over 1.5G of system memory 
 # left to run the OS
 MEM=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
-JM=`expr $MEM \* 6 / 10`
+JM=`expr $MEM \* 8 / 10`
 JAVAMEM="${JM}k"
-METAMEM="800m"
+METAMEM="2800m"
 
 # Extra Java startup args and Looker startup args.  These can also be set in
 # a file named lookerstart.cfg
