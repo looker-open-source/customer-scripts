@@ -39,7 +39,7 @@ fi
 PROTOCOL=""
 LOOKERPORT=${LOOKERPORT:-"9999"}
 
-echo "${LOOKERARGS}" | grep -q "\-\-no\-ssl"
+echo "${LOOKERARGS}" | grep -e "\-\-no\-ssl" -e "\-\-ssl-provided-externally-by"
 if [ $? -eq 0 ] 
 then
 	PROTOCOL='http'
