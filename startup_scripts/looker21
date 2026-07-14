@@ -6,18 +6,22 @@
 #
 
 JAVA_VER=$(java -version 2>&1 | grep 'version "' | head -1 | cut -d'"' -f2 | sed '/^1\./s///' | cut -d'.' -f1)
-if [ "$JAVA_VER" -ne 21 ]; then
+if [ "$JAVA_VER" != "21" ]; then
   WHERE=`which java`
   echo "This script runs with OpenJDK 21, your executable $WHERE has Java major version $JAVA_VER"
   exit 1
 fi
 
-cd $HOME/looker
+cd "$HOME/looker" || exit 1
 # set your java memory- there should be over 1.5G of system memory
 # left to run the OS
-MEM=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
-JM=`expr $MEM \* 6 / 10`
-JAVAMEM="${JM}k"
+MEM=$(cat /proc/meminfo 2>/dev/null | grep MemTotal | awk '{print $2}')
+if [ -n "$MEM" ]; then
+  JM=$((MEM * 6 / 10))
+  JAVAMEM="${JM}k"
+else
+  JAVAMEM="2048m"
+fi
 METAMEM="800m"
 
 # Extra Java startup args and Looker startup args.  These can also be set in
@@ -86,10 +90,14 @@ start() {
 }
 
 stop() {
-    pid=`cat .tmp/looker.pid`
+    if [ ! -f .tmp/looker.pid ]; then
+        echo "Error: .tmp/looker.pid not found."
+        exit 1
+    fi
+    pid=$(cat .tmp/looker.pid)
     if [ -f .status_server_token ] && [ -x /usr/bin/curl ]; then
         state="running"
-        token=`cat .status_server_token`
+        token=$(cat .status_server_token)
         request="control/stop?token=${token}"
         timeout 20 curl -m 10 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/${request} > /dev/null 2>&1
         ECODE=$?
@@ -97,7 +105,8 @@ stop() {
         if [ $ECODE -gt 7 ] ; then
             kill $pid
         fi
-        for i in {1..30}; do
+        i=1
+        while [ $i -le 30 ]; do
             timeout 20 curl -m 5 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
             ECODE=$?
             if [ $ECODE -eq 7 ]; then
@@ -108,6 +117,7 @@ stop() {
                 kill -9 $pid
             fi
             sleep 1
+            i=$((i + 1))
         done
         if [ "${state}" = "running" ]; then
             echo "Force Stop Looker Web Application"
