@@ -1,11 +1,25 @@
 #!/bin/sh
 
 cd $HOME/looker 
-# set your java memory- there should be over 1.5G of system memory 
-# left to run the OS
-MEM=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
-JM=`expr $MEM \* 6 / 10`
-JAVAMEM="${JM}k"
+# set your java memory- heap set to 60% of max OS or if there's a cgroup limit
+memTotalKb="$(awk -F ':? +' '$1 == "MemTotal" { print $2; exit }' /proc/meminfo)"
+if [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+    # "18446744073709551615" is a valid value for "memory.limit_in_bytes", which is too big for Bash math to handle
+    # "$(( 18446744073709551615 / 1024 ))" = 0; "$(( 18446744073709551615 * 40 / 100 ))" = 0
+    memLimitKb="$(awk -v totKb="$memTotalKb" '{
+        limB = $0;
+        limKb = limB / 1024;
+        if (!totKb || limKb < totKb) {
+            printf "%.0f\n", limKb;
+        }
+    }' /sys/fs/cgroup/memory/memory.limit_in_bytes)"
+else
+    memLimitKb="$memTotalKb"
+fi
+JAVAMEM="$(awk -v limKb="$memLimitKb" 'BEGIN{
+        limKb = limKb * 6 / 10;
+        printf "%.0f\n", limKb;
+}')k"
 METAMEM="800m"
 
 # Extra Java startup args and Looker startup args.  These can also be set in
