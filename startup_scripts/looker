@@ -53,7 +53,7 @@ start() {
     java \
   -XX:+UseG1GC -XX:MaxGCPauseMillis=2000 -XX:MaxMetaspaceSize=$METAMEM \
   -Xms$JAVAMEM -Xmx$JAVAMEM \
-  -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCTimeStamps \
+  -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps \
   -Xloggc:/tmp/gc.log  ${JAVAARGS} \
   -jar looker.jar start ${LOOKERARGS}
 
