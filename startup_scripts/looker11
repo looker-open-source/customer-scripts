@@ -99,7 +99,7 @@ stop() {
         if [ $ECODE -gt 7 ] ; then
             kill $pid
         fi
-        for i in {1..30}; do
+        for i in $(seq 1 30); do
             timeout 20 curl -m 5 -ks ${PROTOCOL}://127.0.0.1:${LOOKERPORT}/alive > /dev/null 2>&1
             ECODE=$?
             if [ $ECODE -eq 7 ]; then
