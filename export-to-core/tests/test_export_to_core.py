@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import gzip
 import importlib.util
 import io
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -115,13 +117,28 @@ def _load_module_with_stubs(
     class _FakeEncStream:
 
       def __init__(self, dst):
+        if not dst.writable():
+          raise ValueError('ciphertext_destination must be writable')
         self._dst = dst
+        self.closed = False
 
       def __enter__(self):
         self._dst.write(b'TINK_STREAM:')
-        return self._dst
+        return self
+
+      def write(self, data):
+        if self.closed:
+          raise ValueError('write on closed file')
+        return self._dst.write(data)
+
+      def close(self):
+        if not self.closed:
+          self._dst.write(b':EOF')
+          self._dst.close()
+          self.closed = True
 
       def __exit__(self, exc_type, exc, tb):
+        self.close()
         return False
 
     class _FakePrimitive:
@@ -219,6 +236,14 @@ class LookerExportUnitTest(unittest.TestCase):
     with tempfile.TemporaryDirectory() as tmpdir:
       out_data = os.path.join(tmpdir, 'fs-data')
       out_handle = os.path.join(tmpdir, 'fs-handle')
+      fsync_access_modes: list[int] = []
+      real_fsync = os.fsync
+
+      def _recording_fsync(fd: int) -> None:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fsync_access_modes.append(flags & os.O_ACCMODE)
+        real_fsync(fd)
+
       with (
           mock.patch.object(
               self.exp,
@@ -233,12 +258,46 @@ class LookerExportUnitTest(unittest.TestCase):
           mock.patch.object(
               sys, 'stdin', types.SimpleNamespace(buffer=io.BytesIO(b'PAYLOAD'))
           ),
+          mock.patch.object(os, 'fsync', side_effect=_recording_fsync),
       ):
         self.exp.stream_encrypt(out_data, out_handle)
       self.assertTrue(os.path.isfile(out_data))
       self.assertTrue(os.path.isfile(out_handle))
+      self.assertEqual(len(fsync_access_modes), 2)
+      for mode in fsync_access_modes:
+        self.assertNotEqual(mode, os.O_RDONLY)
       with open(out_handle, 'rb') as fh:
         self.assertEqual(fh.read(), b'HANDLE_BYTES')
+      with open(out_data, 'rb') as fh:
+        self.assertEqual(fh.read(), b'TINK_STREAM:PAYLOAD:EOF')
+
+  def test_run_in_worker_thread_ignores_signal_value_error(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      exporter = self.exp.LookerExporter(backup_arg=tmpdir)
+      exporter.backup_real_path = tmpdir
+      exporter.intermediate_dir = os.path.join(tmpdir, 'intermediate')
+      exporter.final_artifacts_dir = os.path.join(tmpdir, 'final_artifacts')
+      exporter.fs_stage_dir = os.path.join(tmpdir, 'intermediate', 'fs')
+      exporter.mysql_stage_dir = os.path.join(tmpdir, 'intermediate', 'mysql')
+      errors: list[BaseException] = []
+
+      def _worker() -> None:
+        try:
+          with (
+              mock.patch.object(exporter, 'run_preflight_validations'),
+              mock.patch.object(exporter, 'export_database'),
+              mock.patch.object(exporter, 'export_filesystem'),
+              mock.patch.object(exporter, 'generate_metadata_json'),
+              mock.patch.object(exporter, 'cleanup'),
+          ):
+            exporter.run()
+        except BaseException as exc:  # pylint: disable=broad-exception-caught
+          errors.append(exc)
+
+      thread = threading.Thread(target=_worker)
+      thread.start()
+      thread.join()
+      self.assertEqual(errors, [])
 
   def test_validate_free_diskspace_enforces_1_5x_peak_db_estimate(self):
     with tempfile.TemporaryDirectory() as tmpdir:

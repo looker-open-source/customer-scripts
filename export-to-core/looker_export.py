@@ -24,6 +24,7 @@ import datetime
 import fnmatch
 import getpass
 import glob
+import io
 import json
 import os
 import re
@@ -453,6 +454,39 @@ def test_kms() -> None:
     print('OK')
 
 
+class _NonClosingBinaryWriter(io.BufferedIOBase):
+  """Forwards writes to an open binary file without closing its underlying fd.
+
+  Tink's StreamingAead.new_encrypting_stream() closes ciphertext_destination
+  when exiting its context manager (after writing the final AEAD trailer block).
+  Wrapping the destination file lets Tink finalize and flush the ciphertext
+  while keeping the writable file descriptor open for a portable os.fsync().
+  """
+
+  def __init__(self, target: BinaryIO) -> None:
+    super().__init__()
+    self._target = target
+
+  def writable(self) -> bool:
+    return not self.closed
+
+  def write(  # type: ignore[override]
+      self, b: bytes | bytearray | memoryview
+  ) -> int:
+    if self.closed:
+      raise ValueError('write on closed file')
+    return self._target.write(b)
+
+  def flush(self) -> None:
+    if not self.closed:
+      self._target.flush()
+
+  def close(self) -> None:
+    if not self.closed:
+      self._target.flush()
+      super().close()
+
+
 def stream_encrypt(
     out_data_path: str,
     out_handle_path: str,
@@ -486,14 +520,11 @@ def stream_encrypt(
     primitive = dek_handle.primitive(streaming_aead.StreamingAead)
     with open(tmp_data_path, 'wb') as dst_file:
       with primitive.new_encrypting_stream(
-          dst_file, associated_data=b''
+          _NonClosingBinaryWriter(dst_file), associated_data=b''
       ) as enc_stream:
         shutil.copyfileobj(source_stream, enc_stream, length=1024 * 1024)
-    data_fd = os.open(tmp_data_path, os.O_RDONLY)
-    try:
-      os.fsync(data_fd)
-    finally:
-      os.close(data_fd)
+      dst_file.flush()
+      os.fsync(dst_file.fileno())
 
     os.replace(tmp_data_path, out_data_path)
     os.replace(tmp_handle_path, out_handle_path)
@@ -2687,7 +2718,10 @@ class LookerExporter:
   def run(self) -> None:
     """Runs the complete pre-flight validation, export, and encryption flow."""
     for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
-      signal.signal(sig, self._handle_signal)
+      try:
+        signal.signal(sig, self._handle_signal)
+      except (OSError, ValueError):
+        pass
 
     try:
       if self.backup_real_path:
