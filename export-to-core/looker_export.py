@@ -397,6 +397,11 @@ def verify_kek(
         f'({len(ekek_bytes)} bytes < 41).'
     )
 
+  if keywrap is None:
+    sys.exit(
+        'ERROR: Missing required Python cryptographic package '
+        '(cryptography). Run: pip3 install -r requirements.txt'
+    )
   wrapped_kek = ekek_bytes[1:41]
   try:
     kek = keywrap.aes_key_unwrap(raw_cmk, wrapped_kek)
@@ -565,16 +570,29 @@ def check_min_version(version_text: str, min_version: str) -> tuple[bool, str]:
 
 
 def escape_gkeyfile_value(raw_value: str) -> str:
-  """Escapes a value for GLib GKeyFile (--defaults-extra-file)."""
+  """Quotes and escapes an option value for MySQL/mydumper --defaults-extra-file.
+
+  mydumper passes --defaults-extra-file to both libmysqlclient (for the
+  [client] password option, where unquoted '#' starts an inline comment and
+  leading/trailing whitespace is stripped) and GLib GKeyFile (for per-table
+  filter sections). Double-quoting with escaped backslashes, double quotes, and
+  control characters is valid in both parsers and preserves '#', ';', quotes,
+  and surrounding spaces verbatim.
+
+  Args:
+    raw_value: Raw password or option value string.
+
+  Returns:
+    Double-quoted, escaped option string safe for --defaults-extra-file.
+  """
   escaped = (
       raw_value.replace('\\', '\\\\')
+      .replace('"', '\\"')
       .replace('\n', '\\n')
       .replace('\r', '\\r')
       .replace('\t', '\\t')
   )
-  if escaped.startswith(' '):
-    escaped = '\\s' + escaped[1:]
-  return escaped
+  return f'"{escaped}"'
 
 
 def normalize_mysqldump_sql_file(sql_file_path: str) -> None:
@@ -1128,7 +1146,7 @@ class LookerExporter:
 
   def validate_kms_key(self) -> None:
     """Verifies Cloud KMS encryption and Tink Envelope AEAD access."""
-    if not self.kms_key_name.strip():
+    if not self.kms_key_name.strip() or _MISSING_CRYPTO_IMPORT is not None:
       return
     adc_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', '').strip()
     if adc_path and (
@@ -1595,7 +1613,7 @@ class LookerExporter:
 
   def validate_master_key_kek(self) -> None:
     """Verifies LOOKER_MASTER_KEY unwraps the active KEK in encryption_key."""
-    if not self.db_connection_verified:
+    if not self.db_connection_verified or _MISSING_CRYPTO_IMPORT is not None:
       return
 
     queries = (

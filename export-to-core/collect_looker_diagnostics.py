@@ -167,10 +167,17 @@ def _run_mysql_formatted_query(
         check=False,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         text=True,
     )
-    return result.stdout.rstrip('\n') if result.stdout else ''
+    if result.returncode == 0 and result.stdout:
+      return result.stdout.rstrip('\n')
+    combined = '\n'.join(
+        part.rstrip('\n')
+        for part in (result.stdout or '', result.stderr or '')
+        if part.strip()
+    )
+    return combined
   except OSError as err:
     return f'ERROR: Failed to execute mysql client: {err}'
 

@@ -221,9 +221,27 @@ class LookerExportUnitTest(unittest.TestCase):
 
   def test_escape_gkeyfile_value_escapes_backslashes_spaces_and_newlines(self):
     self.assertEqual(
-        self.exp.escape_gkeyfile_value(' pw\\with#hash;semi\nline'),
-        '\\spw\\\\with#hash;semi\\nline',
+        self.exp.escape_gkeyfile_value(' pw\\with"quote#hash;semi\nline '),
+        '" pw\\\\with\\"quote#hash;semi\\nline "',
     )
+
+  def test_missing_crypto_skips_kms_and_kek_without_attribute_error(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      exporter = self.exp.LookerExporter(backup_arg=tmpdir)
+      exporter.kms_key_name = (
+          'projects/p1/locations/us-central1/keyRings/r1/cryptoKeys/k1'
+      )
+      exporter.db_connection_verified = True
+      with (
+          mock.patch.object(self.exp, '_MISSING_CRYPTO_IMPORT', 'No module tink'),
+          mock.patch.object(self.exp, 'keywrap', None),
+          mock.patch.object(self.exp, 'kms', None),
+          mock.patch.object(self.exp, 'tink', None),
+      ):
+        exporter.validate_python_environment()
+        exporter.validate_kms_key()
+        exporter.validate_master_key_kek()
+      self.assertEqual(exporter.preflight_fail_count, 1)
 
   def test_check_min_version(self):
     ok, ver = self.exp.check_min_version('git version 2.43.0', '2.36.0')
@@ -244,6 +262,13 @@ class LookerExportUnitTest(unittest.TestCase):
         fsync_access_modes.append(flags & os.O_ACCMODE)
         real_fsync(fd)
 
+      captured_handles: list[object] = []
+
+      def _fake_wrap(dek_handle: object, kms_uri: str) -> bytes:
+        del kms_uri
+        captured_handles.append(dek_handle)
+        return b'HANDLE_BYTES'
+
       with (
           mock.patch.object(
               self.exp,
@@ -253,7 +278,7 @@ class LookerExportUnitTest(unittest.TestCase):
           mock.patch.object(
               self.exp,
               '_wrap_dek_with_tink_kms',
-              return_value=b'HANDLE_BYTES',
+              side_effect=_fake_wrap,
           ),
           mock.patch.object(
               sys, 'stdin', types.SimpleNamespace(buffer=io.BytesIO(b'PAYLOAD'))
@@ -269,7 +294,15 @@ class LookerExportUnitTest(unittest.TestCase):
       with open(out_handle, 'rb') as fh:
         self.assertEqual(fh.read(), b'HANDLE_BYTES')
       with open(out_data, 'rb') as fh:
-        self.assertEqual(fh.read(), b'TINK_STREAM:PAYLOAD:EOF')
+        ciphertext = fh.read()
+      prim = captured_handles[0].primitive(  # pytype: disable=attribute-error
+          self.exp.streaming_aead.StreamingAead
+      )
+      if hasattr(prim, 'new_decrypting_stream'):
+        with prim.new_decrypting_stream(io.BytesIO(ciphertext), b'') as dec:
+          self.assertEqual(dec.read(), b'PAYLOAD')
+      else:
+        self.assertEqual(ciphertext, b'TINK_STREAM:PAYLOAD:EOF')
 
   def test_run_in_worker_thread_ignores_signal_value_error(self):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -992,7 +1025,7 @@ class LookerExportIntegrationTest(unittest.TestCase):
       ) as wf:
         where_info = json.load(wf)
       self.assertEqual(where_info['mode'], '0o600')
-      self.assertIn('[client]\npassword=s3cr3t#pw', where_info['content'])
+      self.assertIn('[client]\npassword="s3cr3t#pw"', where_info['content'])
       self.assertIn(
           '[`looker`.`oauth_user_state`]\nwhere = 1=0', where_info['content']
       )
