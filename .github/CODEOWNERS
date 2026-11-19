@@ -1,1 +1,3 @@
-*	@looker-open-source/cloud-looker-devrel
+# Co-owned by Looker Control Plane Lifecycle Management (/export-to-core/)
+# and Looker SRE (/onprem-data-verifier/).
+*	@looker-open-source/cloud-looker-eng
