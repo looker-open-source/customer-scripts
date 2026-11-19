@@ -1,0 +1,4 @@
+# Python dependencies for Looker Customer-Hosted to Looker Core export tooling
+cryptography>=41.0.0
+google-cloud-kms>=2.19.0
+tink[gcpkms]>=1.9.0
