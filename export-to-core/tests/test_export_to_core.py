@@ -163,6 +163,7 @@ def _load_module_with_stubs(
 
     gcpkms_mod.GcpKmsClient = _FakeGcpKmsClient
     integ_mod.gcpkms = gcpkms_mod
+    tink_mod.TinkError = type('TinkError', (Exception,), {})
     tink_mod.KeysetHandle = _FakeHandle
     tink_mod.aead = aead_mod
     tink_mod.streaming_aead = saead_mod
@@ -390,6 +391,123 @@ class LookerExportUnitTest(unittest.TestCase):
           "DELETE FROM `setting` WHERE `key` = 'crypt_canary_gcm';\n"
           "DELETE FROM `setting` WHERE `key` = 'closed_system';\n",
       )
+
+  def test_validate_pigz_flags_threads_and_fallback(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      for attr, bad_vals in (
+          ('use_pigz', ('yes', '1', 'invalid')),
+          ('pigz_threads', ('0', '-4', 'abc')),
+          ('auto_install_pigz', ('invalid', '1')),
+      ):
+        for bad_val in bad_vals:
+          exp = self.exp.LookerExporter(backup_arg=tmpdir)
+          setattr(exp, attr, bad_val)
+          exp.validate_pigz()
+          self.assertEqual(exp.preflight_fail_count, 1)
+
+      which_gzip_only = lambda b: '/bin/gzip' if b == 'gzip' else None
+      for mode, expected_fails, expected_passes in (
+          ('true', 1, 0),
+          ('auto', 0, 1),
+      ):
+        exp = self.exp.LookerExporter(backup_arg=tmpdir)
+        exp.use_pigz, exp.auto_install_pigz = mode, 'false'
+        with mock.patch.object(shutil, 'which', side_effect=which_gzip_only):
+          exp.validate_pigz()
+        self.assertEqual(exp.preflight_fail_count, expected_fails)
+        self.assertEqual(exp.preflight_pass_count, expected_passes)
+
+  def test_try_install_pigz_uses_apt_get_or_skips_without_passwordless_sudo(
+      self,
+  ):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      exp = self.exp.LookerExporter(backup_arg=tmpdir)
+      exp.use_pigz, exp.auto_install_pigz = 'auto', 'true'
+      exp.auto_confirm = 'true'
+      installed = {'done': False}
+      cmds: list[list[str]] = []
+
+      def _which(b: str) -> str | None:
+        if b == 'pigz':
+          return '/usr/bin/pigz' if installed['done'] else None
+        return f'/usr/bin/{b}' if b in ('apt-get', 'sudo', 'gzip') else None
+
+      def _run(cmd, **kw):
+        cmds.append(list(cmd))
+        if 'install' in cmd and 'pigz' in cmd:
+          self.assertEqual(kw['env']['DEBIAN_FRONTEND'], 'noninteractive')
+          installed['done'] = True
+        return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+
+      with (
+          mock.patch.object(shutil, 'which', side_effect=_which),
+          mock.patch.object(os, 'geteuid', return_value=1000),
+          mock.patch.object(subprocess, 'run', side_effect=_run),
+      ):
+        exp.validate_pigz()
+      self.assertTrue(installed['done'])
+      self.assertEqual(
+          cmds,
+          [
+              ['sudo', '-n', 'true'],
+              ['sudo', '-n', 'apt-get', 'update', '-qq'],
+              ['sudo', '-n', 'apt-get', 'install', '-y', '-qq', 'pigz'],
+          ],
+      )
+
+      exp2 = self.exp.LookerExporter(backup_arg=tmpdir)
+      exp2.use_pigz, exp2.auto_install_pigz = 'auto', 'true'
+      exp2.auto_confirm = 'true'
+      denied_cmds: list[list[str]] = []
+      which_no_pigz = lambda b: (
+          f'/usr/bin/{b}' if b in ('apt-get', 'sudo', 'gzip') else None
+      )
+      run_fail = lambda c, **_: (
+          denied_cmds.append(list(c))
+          or subprocess.CompletedProcess(c, 1, stdout='', stderr='')
+      )
+      with (
+          mock.patch.object(shutil, 'which', side_effect=which_no_pigz),
+          mock.patch.object(os, 'geteuid', return_value=1000),
+          mock.patch.object(subprocess, 'run', side_effect=run_fail),
+      ):
+        exp2.validate_pigz()
+      self.assertEqual(denied_cmds, [['sudo', '-n', 'true']])
+      self.assertEqual(exp2.preflight_pass_count, 1)
+
+  def test_stream_tar_archive_with_pigz_aborts_when_tar_exits_nonzero(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      fake_bin, stage_dir = os.path.join(tmpdir, 'b'), os.path.join(tmpdir, 's')
+      os.makedirs(fake_bin)
+      os.makedirs(stage_dir)
+      scripts = {
+          'tar': '#!/usr/bin/env python3\nimport sys\nsys.exit(2)\n',
+          'pigz': (
+              '#!/usr/bin/env python3\nimport gzip, sys\n'
+              'sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read()))\n'
+          ),
+      }
+      for name, body in scripts.items():
+        path = os.path.join(fake_bin, name)
+        with open(path, 'w', encoding='utf-8') as fh:
+          fh.write(body)
+        os.chmod(path, 0o700)
+
+      exp = self.exp.LookerExporter(backup_arg=tmpdir)
+      exp.use_pigz, exp.pigz_threads = 'true', '2'
+      new_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
+      with (
+          mock.patch.dict(os.environ, {'PATH': new_path}, clear=False),
+          mock.patch.object(self.exp, 'get_clean_kms_key', return_value='k'),
+          mock.patch.object(
+              self.exp, '_wrap_dek_with_tink_kms', return_value=b'H'
+          ),
+          self.assertRaises(SystemExit) as ctx,
+      ):
+        exp._stream_tar_archive_to_encrypted_artifact(
+            stage_dir, 'missing', f'{tmpdir}/d', f'{tmpdir}/h', 'Archive error'
+        )
+      self.assertEqual(ctx.exception.code, 1)
 
 
 class CollectDiagnosticsTest(unittest.TestCase):
@@ -695,6 +813,8 @@ class LookerExportIntegrationTest(unittest.TestCase):
     ) as f:
       f.write(
           'import types\n'
+          'class TinkError(Exception):\n'
+          '  pass\n\n'
           'class _PassThroughStream:\n'
           '  def __init__(self, dst):\n'
           '    self._dst = dst\n'
@@ -1061,6 +1181,68 @@ class LookerExportIntegrationTest(unittest.TestCase):
       self.assertIn('utf8mb4_general_ci', decompressed_schema)
       self.assertNotIn('utf8mb4_uca1400_ai_ci', decompressed_schema)
       self.assertNotIn('enable the sandbox mode', decompressed_schema)
+
+  @unittest.skipUnless(shutil.which('pigz'), 'Requires pigz binary on PATH')
+  def test_pigz_parallel_compression_and_use_pigz_false_override(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      fx = self._create_hermetic_fixture(tmpdir)
+      base_env = {
+          **os.environ,
+          'PATH': f"{fx['bin_dir']}:{os.environ.get('PATH', '')}",
+          'PYTHONPATH': fx['pylib_dir'],
+          'ON_PREM_LOOKER_DATA_DIR': fx['onprem'],
+          'DB_HOST': '127.0.0.1',
+          'DB_PORT': '3306',
+          'DB_USER': 'looker',
+          'DB_NAME': 'looker',
+          'MYSQL_PWD': 's3cr3t_pw',
+          'LOOKER_MASTER_KEY': base64.b64encode(b'K' * 32).decode('ascii'),
+          'KMS_KEY_NAME': (
+              'projects/p1/locations/us-central1/keyRings/r1/cryptoKeys/k1'
+          ),
+          'USE_MYDUMPER': 'false',
+          'AUTO_CONFIRM': 'true',
+      }
+
+      for sub, cfg, expect_str, forbid_str in (
+          (
+              'pigz',
+              {'USE_PIGZ': 'true', 'PIGZ_THREADS': '2'},
+              "Parallel archive compression enabled with 'pigz' (threads=2).",
+              None,
+          ),
+          (
+              'gzip',
+              {'USE_PIGZ': 'false'},
+              "Single-threaded 'gzip' archive compression enabled"
+              ' (USE_PIGZ=false).',
+              'via pigz',
+          ),
+      ):
+        bdir = os.path.join(tmpdir, f'backup_{sub}')
+        proc = subprocess.run(
+            [sys.executable, LOOKER_EXPORT_PY],
+            env={**base_env, 'BACKUP_DIR': bdir, **cfg},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        with open(os.path.join(bdir, 'looker_export.log'), encoding='utf-8') as f:
+          log_text = f.read()
+        self.assertIn(expect_str, log_text)
+        if forbid_str:
+          self.assertNotIn(forbid_str, log_text)
+        else:
+          self.assertIn("Streaming archive 'looker' via pigz (threads=2)", log_text)
+          self.assertIn(
+              "Streaming archive 'modelshare' via pigz (threads=2)", log_text
+          )
+        fdir = os.path.join(bdir, 'final_artifacts')
+        with tarfile.open(os.path.join(fdir, 'mysql-data'), 'r:gz') as tf:
+          self.assertEqual(tf.getnames(), ['looker'])
+        with tarfile.open(os.path.join(fdir, 'fs-data'), 'r:gz') as tf:
+          self.assertTrue(any(n.startswith('modelshare') for n in tf.getnames()))
 
 
 if __name__ == '__main__':

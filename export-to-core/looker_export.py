@@ -10,9 +10,10 @@
 Combines pre-flight environment/database/filesystem/Git validation,
 single-threaded (mysqldump) and multi-threaded (mydumper + zstd) database
 extraction, client-side SQL collation/BIGINT/setting normalization, Looker
-filesystem staging and Git repository path normalization, RFC 3394 AES Key
-Unwrap verification, Cloud KMS root key encryption, and Tink Streaming AEAD
-(AES128_CTR_HMAC_SHA256_1MB) artifact encryption in a single Python 3 script.
+filesystem staging and Git repository path normalization, multi-threaded (pigz)
+archive compression, RFC 3394 AES Key Unwrap verification, Cloud KMS root key
+encryption, and Tink Streaming AEAD (AES128_CTR_HMAC_SHA256_1MB) artifact
+encryption in a single Python 3 script.
 """
 
 from __future__ import annotations
@@ -163,7 +164,7 @@ BIGINT_PATCH_SQL: Mapping[str, str] = {
     ),
 }
 
-COMMON_REQUIRED_CLI_TOOLS = ('git', 'gzip', 'mysql', 'tar')
+COMMON_REQUIRED_CLI_TOOLS = ('git', 'mysql', 'tar')
 MYSQLDUMP_REQUIRED_CLI_TOOLS = (*COMMON_REQUIRED_CLI_TOOLS, 'mysqldump')
 MYDUMPER_REQUIRED_CLI_TOOLS = (*COMMON_REQUIRED_CLI_TOOLS, 'mydumper', 'zstd')
 
@@ -219,6 +220,9 @@ are used for unset secrets when attached to a terminal):
   USE_MYDUMPER / ENABLE_PARALLEL_EXPORT               (default: false)
   MYDUMPER_THREADS                                    (default: 4)
   MYDUMPER_CHUNK_ROWS                                 (default: 50000)
+  USE_PIGZ                            (default: auto; auto | true | false)
+  PIGZ_THREADS                        (default: auto / all online vCPUs)
+  AUTO_INSTALL_PIGZ                                   (default: true)
   EXCLUDE_MARKETPLACE                                 (default: false)
   DISABLE_SCHEDULED_PLANS                             (default: true)
   LOOKER_INSTANCE_ID                                  (default: onprem-export)
@@ -761,6 +765,11 @@ class LookerExporter:
     )
     self.mydumper_threads = os.environ.get('MYDUMPER_THREADS') or '4'
     self.mydumper_chunk_rows = os.environ.get('MYDUMPER_CHUNK_ROWS') or '50000'
+    self.use_pigz = (os.environ.get('USE_PIGZ') or 'auto').strip().lower()
+    self.pigz_threads = (os.environ.get('PIGZ_THREADS') or '').strip()
+    self.auto_install_pigz = (
+        (os.environ.get('AUTO_INSTALL_PIGZ') or 'true').strip().lower()
+    )
     self.keep_intermediate_files = (
         os.environ.get('KEEP_INTERMEDIATE_FILES') or 'false'
     )
@@ -919,6 +928,95 @@ class LookerExporter:
       if rc != 0:
         self.die(err_msg)
 
+  def _should_use_pigz(self) -> bool:
+    """Returns True when pigz parallel compression is enabled and available."""
+    return self.use_pigz != 'false' and shutil.which('pigz') is not None
+
+  @staticmethod
+  def _kill_and_reap(procs: Sequence[subprocess.Popen[Any] | None]) -> None:
+    """Terminates and reaps any still-running child processes in procs."""
+    for proc in procs:
+      if proc is not None and proc.poll() is None:
+        proc.kill()
+    for proc in procs:
+      if proc is not None:
+        proc.wait()
+
+  def _stream_tar_archive_to_encrypted_artifact(
+      self,
+      stage_dir: str,
+      archive_target: str,
+      out_data: str,
+      out_handle: str,
+      err_msg: str,
+  ) -> None:
+    """Archives and compresses stage_dir/archive_target into Tink AEAD output.
+
+    Uses multi-threaded 'pigz' when enabled and available on PATH, falling back
+    to single-threaded 'tar -czf -' (gzip) otherwise, and verifies exit codes
+    of both 'tar' and 'pigz'.
+    """
+    if not self._should_use_pigz():
+      if self.use_pigz == 'true':
+        self.die(
+            f"{err_msg}: 'pigz' is not available on PATH while USE_PIGZ=true."
+        )
+      cmd = ['tar', '-czf', '-', '-C', stage_dir, archive_target]
+      self._stream_command_to_encrypted_artifact(
+          cmd, out_data, out_handle, err_msg
+      )
+      return
+
+    tar_cmd = ['tar', '-cf', '-', '-C', stage_dir, archive_target]
+    pigz_cmd = ['pigz', '-c']
+    if self.pigz_threads:
+      pigz_cmd.extend(['-p', str(self.pigz_threads)])
+    self.log_debug(
+        f"Streaming archive '{archive_target}' via pigz "
+        f"(threads={self.pigz_threads or 'auto'}) -> '{out_data}'..."
+    )
+    tar_proc: subprocess.Popen[Any] | None = None
+    pigz_proc: subprocess.Popen[Any] | None = None
+    tar_rc: int | None = None
+    pigz_rc: int | None = None
+    try:
+      tar_proc = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE)
+      self._active_procs.append(tar_proc)
+      if tar_proc.stdout is None:
+        self.die(err_msg)
+      pigz_proc = subprocess.Popen(
+          pigz_cmd, stdin=tar_proc.stdout, stdout=subprocess.PIPE
+      )
+      self._active_procs.append(pigz_proc)
+      tar_proc.stdout.close()  # Ensure tar receives SIGPIPE if pigz exits.
+      if pigz_proc.stdout is None:
+        self.die(err_msg)
+      stream_encrypt(out_data, out_handle, input_stream=pigz_proc.stdout)
+      pigz_proc.stdout.close()
+      pigz_rc = pigz_proc.wait()
+      tar_rc = tar_proc.wait()
+    except SystemExit as err:
+      if self._cleaned_up:
+        raise
+      self._kill_and_reap((pigz_proc, tar_proc))
+      self.die(f'{err_msg}: {err}')
+    except (OSError, ValueError, RuntimeError, tink.TinkError) as err:
+      self._kill_and_reap((pigz_proc, tar_proc))
+      self.die(f'{err_msg}: {err}')
+    finally:
+      for proc, rc_val in ((pigz_proc, pigz_rc), (tar_proc, tar_rc)):
+        if proc is not None:
+          if proc.stdout is not None and not proc.stdout.closed:
+            proc.stdout.close()
+          if proc in self._active_procs:
+            self._active_procs.remove(proc)
+          if rc_val is None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    if tar_rc != 0 or pigz_rc != 0:
+      self.die(f'{err_msg} (tar exit={tar_rc}, pigz exit={pigz_rc}).')
+
   def _perform_cleanup(self, exit_code: int) -> None:
     """Terminates child processes, scrubs secrets, and removes staging dirs."""
     if self._cleaned_up:
@@ -1049,6 +1147,154 @@ class LookerExporter:
           'Tools',
           f"All required CLI binaries ({' '.join(required_tools)}) are "
           'available on PATH.',
+      )
+
+  def _try_install_pigz(self) -> bool:
+    """Attempts to install 'pigz' via the OS package manager when missing."""
+    if shutil.which('pigz') is not None:
+      return True
+    is_root = hasattr(os, 'geteuid') and os.geteuid() == 0
+    interactive = self.auto_confirm != 'true' and sys.stdin.isatty()
+    apt_steps = (
+        ('apt-get', 'update', '-qq'),
+        ('apt-get', 'install', '-y', '-qq', 'pigz'),
+    )
+    pkg_managers: tuple[tuple[str, Sequence[Sequence[str]]], ...] = (
+        ('apt-get', apt_steps),
+        ('dnf', (('dnf', 'install', '-y', '-q', 'pigz'),)),
+        ('yum', (('yum', 'install', '-y', '-q', 'pigz'),)),
+        ('zypper', (('zypper', '--non-interactive', 'install', 'pigz'),)),
+        ('apk', (('apk', 'add', '--no-cache', 'pigz'),)),
+    )
+    mgr, steps, needs_root = next(
+        ((m, s, True) for m, s in pkg_managers if shutil.which(m)),
+        (None, (), True),
+    )
+    if not mgr and not is_root and shutil.which('brew'):
+      mgr, steps, needs_root = 'brew', (('brew', 'install', 'pigz'),), False
+    if not mgr:
+      return False
+
+    sudo_prefix: tuple[str, ...] = ()
+    if needs_root and not is_root:
+      if not shutil.which('sudo'):
+        return False
+      if not interactive:
+        try:
+          probe = subprocess.run(
+              ['sudo', '-n', 'true'],
+              check=False,
+              stdin=subprocess.DEVNULL,
+              stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL,
+              timeout=5,
+          )
+        except (OSError, subprocess.SubprocessError):
+          return False
+        if probe.returncode != 0:
+          return False
+        sudo_prefix = ('sudo', '-n')
+      else:
+        sudo_prefix = ('sudo',)
+
+    if interactive:
+      sys.stderr.write(
+          f"  [PROMPT] Install 'pigz' via '{mgr}' for parallel compression? "
+          '[y/N]: '
+      )
+      sys.stderr.flush()
+      if not re.fullmatch(r'[Yy]([Ee][Ss])?', sys.stdin.readline().strip()):
+        return False
+
+    self.log_info(f"Installing 'pigz' via '{mgr}' for parallel compression...")
+    cmd_env = {**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'}
+    for step in steps:
+      full_cmd = [*sudo_prefix, *step]
+      try:
+        proc = subprocess.run(
+            full_cmd,
+            check=False,
+            env=cmd_env if mgr == 'apt-get' else None,
+            stdin=None if interactive else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+        )
+      except (OSError, subprocess.SubprocessError) as err:
+        self.log_warn(f"Failed executing '{' '.join(full_cmd)}': {err}")
+        return False
+      if proc.returncode != 0:
+        self.log_warn(
+            f"Command '{' '.join(full_cmd)}' failed (exit {proc.returncode})."
+        )
+        return False
+    if shutil.which('pigz') is not None:
+      self.log_info("Successfully installed 'pigz'.")
+      return True
+    return False
+
+  def validate_pigz(self) -> None:
+    """Validates USE_PIGZ/PIGZ_THREADS and installs or resolves pigz/gzip."""
+    if self.use_pigz not in ('auto', 'true', 'false'):
+      self.preflight_fail(
+          'Compression',
+          f"USE_PIGZ must be 'auto', 'true', or 'false' ('{self.use_pigz}').",
+      )
+      return
+    if self.auto_install_pigz not in ('true', 'false'):
+      self.preflight_fail(
+          'Compression',
+          "AUTO_INSTALL_PIGZ must be 'true' or 'false' "
+          f"('{self.auto_install_pigz}').",
+      )
+      return
+    if self.pigz_threads and not re.fullmatch(r'[1-9]\d*', self.pigz_threads):
+      self.preflight_fail(
+          'Compression',
+          f"PIGZ_THREADS must be an integer >= 1 ('{self.pigz_threads}').",
+      )
+      return
+    if self.use_pigz == 'false':
+      if shutil.which('gzip'):
+        self.preflight_pass(
+            'Compression',
+            "Single-threaded 'gzip' archive compression enabled "
+            '(USE_PIGZ=false).',
+        )
+      else:
+        self.preflight_fail(
+            'Compression',
+            "Missing required CLI binary 'gzip' on PATH when USE_PIGZ=false.",
+        )
+      return
+
+    if shutil.which('pigz') is None and self.auto_install_pigz == 'true':
+      self._try_install_pigz()
+    if shutil.which('pigz') is not None:
+      self.preflight_pass(
+          'Compression',
+          "Parallel archive compression enabled with 'pigz' "
+          f"(threads={self.pigz_threads or 'auto'}).",
+      )
+    elif self.use_pigz == 'true':
+      self.preflight_fail(
+          'Compression',
+          "Missing required CLI binary 'pigz' on PATH when USE_PIGZ=true "
+          "(install 'pigz' or set USE_PIGZ=false).",
+      )
+    elif shutil.which('gzip') is not None:
+      self.log_info(
+          "'pigz' not found on PATH; falling back to single-threaded 'gzip' "
+          "compression (install 'pigz' for faster multi-core packaging)."
+      )
+      self.preflight_pass(
+          'Compression',
+          "Single-threaded 'gzip' archive compression available on PATH.",
+      )
+    else:
+      self.preflight_fail(
+          'Compression', "Neither 'pigz' nor 'gzip' is available on PATH."
       )
 
   def validate_mydumper(self) -> None:
@@ -1815,6 +2061,12 @@ class LookerExporter:
     if self.use_mydumper == 'true':
       self.log_info(f'  MYDUMPER_THREADS          : {self.mydumper_threads}')
       self.log_info(f'  MYDUMPER_CHUNK_ROWS       : {self.mydumper_chunk_rows}')
+    self.log_info(f'  USE_PIGZ                  : {self.use_pigz}')
+    if self.use_pigz != 'false':
+      self.log_info(
+          f"  PIGZ_THREADS              : {self.pigz_threads or 'auto'}"
+      )
+      self.log_info(f'  AUTO_INSTALL_PIGZ         : {self.auto_install_pigz}')
     self.log_info(
         f'  KEEP_INTERMEDIATE_FILES   : {self.keep_intermediate_files}'
     )
@@ -1886,6 +2138,7 @@ class LookerExporter:
     self.print_normalized_inputs_and_confirm()
 
     self.validate_cli_tools()
+    self.validate_pigz()
     self.validate_mydumper()
     self.validate_git_version()
     self.validate_python_environment()
@@ -2191,17 +2444,17 @@ class LookerExporter:
 
     self.log_debug(
         f'Packaging and encrypting MySQL database archive ({MYSQL_DATA_FILE}, '
-        f'USE_MYDUMPER={self.use_mydumper})...'
+        f'USE_MYDUMPER={self.use_mydumper}, USE_PIGZ={self.use_pigz})...'
     )
     if self.use_mydumper == 'true':
-      cmd = ['tar', '-czf', '-', '-C', self.mysql_stage_dir, '.']
+      archive_target = '.'
       err_msg = 'Failed to package and encrypt mydumper database archive.'
     else:
-      cmd = ['tar', '-czf', '-', '-C', self.mysql_stage_dir, 'looker']
+      archive_target = 'looker'
       err_msg = 'Failed to package and encrypt database dump.'
 
-    self._stream_command_to_encrypted_artifact(
-        cmd, out_data, out_handle, err_msg
+    self._stream_tar_archive_to_encrypted_artifact(
+        self.mysql_stage_dir, archive_target, out_data, out_handle, err_msg
     )
 
     if self.keep_intermediate_files != 'true':
@@ -2668,11 +2921,12 @@ class LookerExporter:
     out_handle = os.path.join(self.final_artifacts_dir, FS_HANDLE_FILE)
 
     self.log_debug(
-        f'Packaging and encrypting filesystem archive ({FS_DATA_FILE})...'
+        f'Packaging and encrypting filesystem archive ({FS_DATA_FILE}, '
+        f'USE_PIGZ={self.use_pigz})...'
     )
-    cmd = ['tar', '-czf', '-', '-C', self.intermediate_dir, 'modelshare']
-    self._stream_command_to_encrypted_artifact(
-        cmd,
+    self._stream_tar_archive_to_encrypted_artifact(
+        self.intermediate_dir,
+        'modelshare',
         out_data,
         out_handle,
         'Failed to package and encrypt filesystem archive.',
