@@ -189,6 +189,10 @@ export PIGZ_THREADS="8"            # Optional: parallel pigz threads (default: a
 | `EXCLUDE_MARKETPLACE` | Set to `true` to exclude Looker Marketplace directories and tables from the export. | `false` |
 | `DISABLE_SCHEDULED_PLANS` | Set `scheduled_plan.enabled = FALSE` in the exported database artifact (leaves live source DB untouched) to prevent automatic runs immediately after import. | `true` |
 | `LOOKER_INSTANCE_ID` | Optional source identifier recorded as `looker_instance` in `metadata.json`. | `onprem-export` |
+| `LOOKER_REPLICAS` | Optional cluster node/replica count recorded in `instanceInfra` for Looker (Google Cloud core) import sizing (auto-detected from active `node` table heartbeats when unset). | *(auto)* |
+| `LOOKER_CPUS` | Optional per-node CPU count recorded in `instanceInfra` (auto-detected from host logical vCPUs when unset). | *(auto)* |
+| `LOOKER_MEMORY_GB` | Optional per-node memory in GiB recorded in `instanceInfra` (auto-detected from running Looker JVM `-Xmx` or host `MemTotal` when unset). | *(auto)* |
+| `LOOKER_STARTUP_ARGS` | Optional Looker startup flags recorded in `instanceInfra.commandLineArgs` with sensitive values redacted (auto-detected from running Looker JVM when unset). | *(auto)* |
 | `AUTO_CONFIRM` | Set to `true` to skip interactive confirmation prompts (for non-interactive automation). | `false` |
 | `DEBUG_LOG_ENABLED` | Write verbose `DEBUG` trace entries to `${BACKUP_DIR}/looker_export.log`. | `true` |
 | `KEEP_INTERMEDIATE_FILES` | Retain unencrypted staging directories under `${BACKUP_DIR}/intermediate/` after exit (debugging only). | `false` |
@@ -211,13 +215,15 @@ export PIGZ_THREADS="8"            # Optional: parallel pigz threads (default: a
 
 ## Output Artifacts
 
-Upon successful completion, `looker_export.py` generates five files in `${BACKUP_DIR}/final_artifacts/`:
+Upon successful completion, `looker_export.py` generates seven files in `${BACKUP_DIR}/final_artifacts/`:
 
 - `fs-data`: Tink Streaming AEAD-encrypted `.tar.gz` archive containing normalized LookML Git and Looker file system directories.
 - `fs-handle`: Cloud KMS envelope-encrypted Tink keyset handle (DEK) for `fs-data`.
 - `mysql-data`: Tink Streaming AEAD-encrypted `.tar.gz` archive containing the Looker database export (`mysqldump` SQL dump or `mydumper` + `zstd` archive).
 - `mysql-handle`: Cloud KMS envelope-encrypted Tink keyset handle (DEK) for `mysql-data`.
-- `metadata.json`: Export manifest containing the Looker instance identifier (`looker_instance`), detected Looker version (`looker_version`), canonical Cloud KMS CryptoKey resource (`export_encryption_key.cmek`), Cloud KMS-encrypted 32-byte Looker master key (`looker_encryption_key`), migration `source`, and exported `file_paths`.
+- `export_info.json.enc`: Tink Streaming AEAD-encrypted `ExportInfo` manifest containing source Looker infrastructure sizing (`instanceInfra` replicas, CPUs, memory, sanitized startup args) and `componentConfigs`.
+- `export_info-handle.enc`: Cloud KMS envelope-encrypted Tink keyset handle (DEK) for `export_info.json.enc`.
+- `metadata.json`: Export manifest containing the Looker instance identifier (`looker_instance`), detected Looker version (`looker_version`), canonical Cloud KMS CryptoKey resource (`export_encryption_key.cmek`), Cloud KMS-encrypted 32-byte Looker master key (`looker_encryption_key`), migration `source`, exported `file_paths`, `exportTime`, `exportMetrics` (component `sizeGb` and durations for `ALL`, `DB`, and `FS`), and `instanceInfra` / `componentConfigs` for Looker (Google Cloud core) import sizing and tiering.
 
 All output artifacts are created with strict owner-only permissions (`0600`).
 

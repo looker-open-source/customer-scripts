@@ -68,6 +68,8 @@ FS_DATA_FILE = 'fs-data'
 FS_HANDLE_FILE = 'fs-handle'
 MYSQL_DATA_FILE = 'mysql-data'
 MYSQL_HANDLE_FILE = 'mysql-handle'
+EXPORT_INFO_FILE = 'export_info.json.enc'
+EXPORT_INFO_HANDLE_FILE = 'export_info-handle.enc'
 METADATA_FILE = 'metadata.json'
 
 REQUIRED_INPUT_VARS = (
@@ -196,6 +198,10 @@ _MODELS_PATH_RE = re.compile(
 )
 _ID_RSA_BAK_RE = re.compile(r'/id_rsa\.bak([\s"\']|$)', re.MULTILINE)
 _SCP_STYLE_REMOTE_RE = re.compile(r'^[^/]+@[^:]+:')
+_XMX_RE = re.compile(r'(?:^|\s)-Xmx(\d+)([kKmMgGtT])(?=\s|$)')
+_SENSITIVE_ARG_RE = re.compile(
+    r'(?i)(password|passwd|pwd|secret|token|master[_-]?key|credential|key)'
+)
 
 _USAGE_TEXT = """\
 Usage: ./looker_export.py [BACKUP_DIR]
@@ -226,6 +232,10 @@ are used for unset secrets when attached to a terminal):
   EXCLUDE_MARKETPLACE                                 (default: false)
   DISABLE_SCHEDULED_PLANS                             (default: true)
   LOOKER_INSTANCE_ID                                  (default: onprem-export)
+  LOOKER_REPLICAS          (optional override; auto-detected from node table)
+  LOOKER_CPUS              (optional override; auto-detected from host vCPUs)
+  LOOKER_MEMORY_GB         (optional override; auto-detected from JVM/RAM)
+  LOOKER_STARTUP_ARGS      (optional override; auto-detected from Looker JVM)
   KEEP_INTERMEDIATE_FILES                             (default: false)
   DEBUG_LOG_ENABLED                                   (default: true)
   AUTO_CONFIRM                                        (default: false)
@@ -713,6 +723,62 @@ def _resolve_env_with_alias(
   return default_value
 
 
+def _parse_jvm_xmx_gb(cmd_line: str) -> float | None:
+  """Extracts JVM -Xmx heap size in GiB from a command line, if present."""
+  match = _XMX_RE.search(cmd_line)
+  if not match:
+    return None
+  amount = int(match.group(1))
+  unit = match.group(2).lower()
+  multipliers = {
+      'k': 1.0 / (1024.0 * 1024.0),
+      'm': 1.0 / 1024.0,
+      'g': 1.0,
+      't': 1024.0,
+  }
+  return round(amount * multipliers[unit], 2)
+
+
+def _sanitize_command_line_args(raw_args: str) -> str:
+  """Redacts sensitive flag values from captured Looker startup arguments."""
+  tokens = raw_args.strip().split()
+  sanitized: list[str] = []
+  redact_next = False
+  for tok in tokens:
+    if redact_next:
+      sanitized.append('REDACTED')
+      redact_next = False
+      continue
+    if '=' in tok:
+      flag_name, _ = tok.split('=', 1)
+      if _SENSITIVE_ARG_RE.search(flag_name):
+        sanitized.append(f'{flag_name}=REDACTED')
+        continue
+    elif tok in ('-p', '--password') or (
+        tok.startswith('-') and _SENSITIVE_ARG_RE.search(tok)
+    ):
+      sanitized.append(tok)
+      redact_next = True
+      continue
+    sanitized.append(tok)
+  return ' '.join(sanitized)
+
+
+def _format_rfc3339_utc(dt_val: datetime.datetime) -> str:
+  """Formats a UTC datetime as RFC 3339 with trailing Z."""
+  return dt_val.astimezone(datetime.timezone.utc).strftime(
+      '%Y-%m-%dT%H:%M:%SZ'
+  )
+
+
+def _format_proto_duration(
+    start_dt: datetime.datetime, end_dt: datetime.datetime
+) -> str:
+  """Formats elapsed duration between two timestamps as ProtoJSON '<sec>s'."""
+  elapsed = max(0.0, (end_dt - start_dt).total_seconds())
+  return f'{elapsed:.3f}s'
+
+
 # ==============================================================================
 # 3. Unified Export Orchestrator
 # ==============================================================================
@@ -753,6 +819,16 @@ class LookerExporter:
     self.looker_instance_id = (
         os.environ.get('LOOKER_INSTANCE_ID') or 'onprem-export'
     )
+    self.looker_replicas_override = (
+        os.environ.get('LOOKER_REPLICAS') or ''
+    ).strip()
+    self.looker_cpus_override = (os.environ.get('LOOKER_CPUS') or '').strip()
+    self.looker_memory_gb_override = (
+        os.environ.get('LOOKER_MEMORY_GB') or ''
+    ).strip()
+    self.looker_startup_args_override = (
+        os.environ.get('LOOKER_STARTUP_ARGS') or ''
+    ).strip()
 
     self.exclude_marketplace = os.environ.get('EXCLUDE_MARKETPLACE') or 'false'
     self.disable_scheduled_plans = (
@@ -805,6 +881,18 @@ class LookerExporter:
     self.db_connection_verified = False
     self.active_encrypted_kek = ''
     self.estimated_db_kb = 0
+    self.detected_replicas = 1
+    self.detected_cpus = float(os.cpu_count() or 1)
+    self.detected_memory_gb = 0.0
+    self.detected_limit_memory_gb = 0.0
+    self.detected_command_line_args = ''
+    self.export_start_dt: datetime.datetime | None = None
+    self.db_export_start_dt: datetime.datetime | None = None
+    self.db_export_end_dt: datetime.datetime | None = None
+    self.fs_export_start_dt: datetime.datetime | None = None
+    self.fs_export_end_dt: datetime.datetime | None = None
+    self.exported_db_bytes = 0
+    self.exported_fs_bytes = 0
     self.dumped_tables: list[str] = []
     self.excluded_tables: list[str] = []
     self.schema_only_tables_existing: list[str] = []
@@ -1980,6 +2068,142 @@ class LookerExporter:
         f"plus filtered '{SETTING_DB_TABLE}'.",
     )
 
+  def _detect_host_memory_gb(self) -> float:
+    """Returns total host physical RAM in GiB from /proc/meminfo or sysconf."""
+    try:
+      if os.path.isfile('/proc/meminfo'):
+        with open('/proc/meminfo', encoding='utf-8') as mem_file:
+          for line in mem_file:
+            if line.startswith('MemTotal:'):
+              parts = line.split()
+              if len(parts) >= 2 and parts[1].isdigit():
+                return round(int(parts[1]) / (1024.0 * 1024.0), 2)
+    except OSError:
+      pass
+    try:
+      page_size = os.sysconf('SC_PAGE_SIZE')
+      phys_pages = os.sysconf('SC_PHYS_PAGES')
+      if isinstance(page_size, int) and isinstance(phys_pages, int):
+        if page_size > 0 and phys_pages > 0:
+          return round((page_size * phys_pages) / float(1024**3), 2)
+    except (AttributeError, OSError, ValueError):
+      pass
+    return 0.0
+
+  def _detect_running_looker_jvm(self) -> tuple[float | None, str]:
+    """Inspects local processes for a running Looker JVM (-Xmx & args)."""
+    if not shutil.which('ps'):
+      return None, ''
+    try:
+      res = subprocess.run(
+          ['ps', '-eo', 'args'],
+          check=False,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.DEVNULL,
+          text=True,
+      )
+    except OSError:
+      return None, ''
+    if res.returncode != 0 or not res.stdout:
+      return None, ''
+    for raw_line in res.stdout.splitlines():
+      line = raw_line.strip()
+      if 'java' in line and 'looker.jar' in line:
+        return _parse_jvm_xmx_gb(line), _sanitize_command_line_args(line)
+    return None, ''
+
+  def discover_source_infra(self) -> None:
+    """Detects source Looker replica count, CPUs, memory, and startup flags."""
+    replicas = 1
+    if self.looker_replicas_override:
+      try:
+        replicas = max(1, int(self.looker_replicas_override))
+      except ValueError:
+        self.preflight_warn(
+            'Source Infrastructure',
+            f"Invalid LOOKER_REPLICAS='{self.looker_replicas_override}'; "
+            'falling back to database node discovery.',
+        )
+        self.looker_replicas_override = ''
+
+    if not self.looker_replicas_override and self.db_connection_verified:
+      active_res = self.run_mysql_query(
+          'SELECT COUNT(*) FROM `node` '
+          'WHERE `last_heartbeat` >= NOW() - INTERVAL 15 MINUTE;'
+      )
+      parsed_count = 0
+      if active_res.returncode == 0:
+        out_str = (active_res.stdout or '').strip()
+        if out_str.isdigit():
+          parsed_count = int(out_str)
+      if parsed_count <= 0:
+        total_res = self.run_mysql_query('SELECT COUNT(*) FROM `node`;')
+        if total_res.returncode == 0:
+          out_str = (total_res.stdout or '').strip()
+          if out_str.isdigit():
+            parsed_count = int(out_str)
+      if parsed_count > 0:
+        replicas = parsed_count
+    self.detected_replicas = max(1, replicas)
+
+    cpus = float(os.cpu_count() or 1)
+    if self.looker_cpus_override:
+      try:
+        cpus = max(0.1, float(self.looker_cpus_override))
+      except ValueError:
+        self.preflight_warn(
+            'Source Infrastructure',
+            f"Invalid LOOKER_CPUS='{self.looker_cpus_override}'; "
+            f'using host vCPU count ({cpus}).',
+        )
+    self.detected_cpus = round(cpus, 2)
+
+    host_mem_gb = self._detect_host_memory_gb()
+    jvm_xmx_gb, jvm_cmd_args = self._detect_running_looker_jvm()
+    mem_gb = jvm_xmx_gb if jvm_xmx_gb is not None else host_mem_gb
+    if self.looker_memory_gb_override:
+      try:
+        mem_gb = max(0.1, float(self.looker_memory_gb_override))
+      except ValueError:
+        self.preflight_warn(
+            'Source Infrastructure',
+            f"Invalid LOOKER_MEMORY_GB='{self.looker_memory_gb_override}'; "
+            f'using detected memory ({mem_gb} GiB).',
+        )
+    self.detected_memory_gb = round(mem_gb, 2)
+    self.detected_limit_memory_gb = round(max(host_mem_gb, mem_gb), 2)
+
+    if self.looker_startup_args_override:
+      self.detected_command_line_args = _sanitize_command_line_args(
+          self.looker_startup_args_override
+      )
+    else:
+      self.detected_command_line_args = jvm_cmd_args
+
+    self.log_debug(
+        'Detected source Looker infrastructure: '
+        f'replicas={self.detected_replicas}, cpus={self.detected_cpus}, '
+        f'memory_gb={self.detected_memory_gb}, '
+        f'limit_memory_gb={self.detected_limit_memory_gb}'
+    )
+
+  @staticmethod
+  def _calculate_dir_size_bytes(target_dir: str) -> int:
+    """Computes total bytes of regular non-symlink files in target_dir."""
+    if not target_dir or not os.path.isdir(target_dir):
+      return 0
+    total = 0
+    for root, _, files in os.walk(target_dir, followlinks=False):
+      for f_name in files:
+        f_full = os.path.join(root, f_name)
+        if os.path.islink(f_full):
+          continue
+        try:
+          total += os.lstat(f_full).st_size
+        except OSError:
+          pass
+    return total
+
   def _calculate_fs_size_kb(self) -> int:
     """Computes total uncompressed size (in KB) of allowed Looker subdirs."""
     if not self.on_prem_real_path:
@@ -2149,6 +2373,7 @@ class LookerExporter:
     self.validate_looker_version()
     self.validate_master_key_kek()
     self.discover_database_tables()
+    self.discover_source_infra()
     self.validate_free_diskspace()
 
     self.print_validation_summary_and_confirm()
@@ -2462,6 +2687,7 @@ class LookerExporter:
 
   def export_database(self) -> None:
     """Exports and encrypts the Looker MySQL/MariaDB database."""
+    self.db_export_start_dt = datetime.datetime.now(datetime.timezone.utc)
     os.makedirs(self.mysql_stage_dir, exist_ok=True)
     self.log_info(
         f"Exporting and encrypting database '{self.db_name}' "
@@ -2471,7 +2697,10 @@ class LookerExporter:
       self.export_database_with_mydumper()
     else:
       self.export_database_with_mysqldump()
+    staged_db_bytes = self._calculate_dir_size_bytes(self.mysql_stage_dir)
+    self.exported_db_bytes = max(staged_db_bytes, self.estimated_db_kb * 1024)
     self.encrypt_database_dump()
+    self.db_export_end_dt = datetime.datetime.now(datetime.timezone.utc)
     self.log_info(
         f'Database export completed ({MYSQL_DATA_FILE}, {MYSQL_HANDLE_FILE}).'
     )
@@ -2934,13 +3163,16 @@ class LookerExporter:
 
   def export_filesystem(self) -> None:
     """Stages, prunes, normalizes Git repos, and encrypts the filesystem."""
+    self.fs_export_start_dt = datetime.datetime.now(datetime.timezone.utc)
     self.log_info(
         'Exporting, normalizing, and encrypting Looker filesystem...'
     )
     self.stage_filesystem()
     self.prune_staging_filesystem()
     self.normalize_git_repositories()
+    self.exported_fs_bytes = self._calculate_dir_size_bytes(self.fs_stage_dir)
     self.package_filesystem()
+    self.fs_export_end_dt = datetime.datetime.now(datetime.timezone.utc)
     self.log_info(
         f'Filesystem export completed ({FS_DATA_FILE}, {FS_HANDLE_FILE}).'
     )
@@ -2948,6 +3180,120 @@ class LookerExporter:
   # ============================================================================
   # Metadata Generation & Main Execution
   # ============================================================================
+  def _build_instance_infra_payload(self) -> dict[str, Any]:
+    """Builds InstanceInfra JSON payload matching export_info.proto."""
+    deployment_cfg: dict[str, Any] = {
+        'type': 'LOOKER',
+        'cpus': self.detected_cpus,
+        'memoryGb': self.detected_memory_gb,
+        'replicas': self.detected_replicas,
+        'limitCpu': self.detected_cpus,
+        'limitMemoryGb': self.detected_limit_memory_gb,
+    }
+    infra_payload: dict[str, Any] = {
+        'deploymentConfigs': [deployment_cfg],
+    }
+    if self.detected_command_line_args:
+      infra_payload['commandLineArgs'] = self.detected_command_line_args
+    return infra_payload
+
+  def _build_component_configs_payload(self) -> list[dict[str, Any]]:
+    """Builds ComponentConfig list matching export_info.proto."""
+    mysql_export_type = (
+        'MYDUMPER' if self.use_mydumper == 'true' else 'MYSQLDUMP'
+    )
+    return [
+        {
+            'type': 'DB',
+            'identifier': self.db_name,
+            'exportType': {
+                'mysqlExportType': mysql_export_type,
+            },
+        },
+        {
+            'type': 'FS',
+            'identifier': (
+                self.on_prem_real_path or self.on_prem_looker_data_path
+            ),
+            'exportType': {
+                'filesystemExportType': 'ARCHIVE',
+            },
+        },
+    ]
+
+  def generate_export_info(self) -> None:
+    """Encrypts ExportInfo (instanceInfra, replicas, componentConfigs)."""
+    out_data = os.path.join(self.final_artifacts_dir, EXPORT_INFO_FILE)
+    out_handle = os.path.join(self.final_artifacts_dir, EXPORT_INFO_HANDLE_FILE)
+    self.log_info(
+        f'Generating encrypted source infrastructure metadata '
+        f'({EXPORT_INFO_FILE}, {EXPORT_INFO_HANDLE_FILE})...'
+    )
+    export_info_payload: dict[str, Any] = {
+        'sourceInstance': self.looker_instance_id or 'onprem-export',
+        'instanceInfra': self._build_instance_infra_payload(),
+        'componentConfigs': self._build_component_configs_payload(),
+    }
+    raw_bytes = (json.dumps(export_info_payload, indent=2) + '\n').encode(
+        'utf-8'
+    )
+    try:
+      stream_encrypt(
+          out_data, out_handle, input_stream=io.BytesIO(raw_bytes)
+      )
+    except (
+        SystemExit,
+        Exception,  # pylint: disable=broad-exception-caught
+    ) as err:
+      self.die(f'Failed to encrypt export info metadata: {err}')
+
+  def _build_export_metrics_payload(
+      self, now_dt: datetime.datetime
+  ) -> dict[str, Any]:
+    """Builds ExportMetrics JSON payload matching export_metadata.proto."""
+    overall_start = self.export_start_dt or self.db_export_start_dt or now_dt
+    db_start = self.db_export_start_dt or overall_start
+    db_end = self.db_export_end_dt or now_dt
+    fs_start = self.fs_export_start_dt or db_end
+    fs_end = self.fs_export_end_dt or now_dt
+
+    gib = float(1024**3)
+    db_size_gb = round(self.exported_db_bytes / gib, 6)
+    fs_size_gb = round(self.exported_fs_bytes / gib, 6)
+    all_size_gb = round(
+        (self.exported_db_bytes + self.exported_fs_bytes) / gib, 6
+    )
+
+    return {
+        'instanceInternalName': self.looker_instance_id or 'onprem-export',
+        'componentMetrics': [
+            {
+                'type': 'ALL',
+                'sizeGb': all_size_gb,
+                'duration': _format_proto_duration(overall_start, now_dt),
+                'retryCount': 0,
+                'startTime': _format_rfc3339_utc(overall_start),
+                'endTime': _format_rfc3339_utc(now_dt),
+            },
+            {
+                'type': 'DB',
+                'sizeGb': db_size_gb,
+                'duration': _format_proto_duration(db_start, db_end),
+                'retryCount': 0,
+                'startTime': _format_rfc3339_utc(db_start),
+                'endTime': _format_rfc3339_utc(db_end),
+            },
+            {
+                'type': 'FS',
+                'sizeGb': fs_size_gb,
+                'duration': _format_proto_duration(fs_start, fs_end),
+                'retryCount': 0,
+                'startTime': _format_rfc3339_utc(fs_start),
+                'endTime': _format_rfc3339_utc(fs_end),
+            },
+        ],
+    }
+
   def generate_metadata_json(self) -> None:
     """Writes final_artifacts/metadata.json compatible with Looker Core SLM."""
     out_meta = os.path.join(self.final_artifacts_dir, METADATA_FILE)
@@ -2959,6 +3305,10 @@ class LookerExporter:
     except SystemExit as err:
       self.die(f'Failed to generate encryption metadata: {err}')
       return
+
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    start_dt = self.export_start_dt or now_dt
+    export_time_us = str(int(start_dt.timestamp() * 1_000_000))
 
     metadata_payload = {
         'looker_instance': self.looker_instance_id or 'onprem-export',
@@ -2973,7 +3323,13 @@ class LookerExporter:
             FS_HANDLE_FILE,
             MYSQL_DATA_FILE,
             MYSQL_HANDLE_FILE,
+            EXPORT_INFO_FILE,
+            EXPORT_INFO_HANDLE_FILE,
         ],
+        'exportTime': export_time_us,
+        'exportMetrics': self._build_export_metrics_payload(now_dt),
+        'instanceInfra': self._build_instance_infra_payload(),
+        'componentConfigs': self._build_component_configs_payload(),
     }
     with open(out_meta, 'w', encoding='utf-8') as mf:
       json.dump(metadata_payload, mf, indent=2)
@@ -3012,8 +3368,10 @@ class LookerExporter:
       os.chmod(self.intermediate_dir, 0o700)
       os.chmod(self.final_artifacts_dir, 0o700)
 
+      self.export_start_dt = datetime.datetime.now(datetime.timezone.utc)
       self.export_database()
       self.export_filesystem()
+      self.generate_export_info()
       self.generate_metadata_json()
 
       self.log_info('=== Looker Migration Export Completed Successfully ===')

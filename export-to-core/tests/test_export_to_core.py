@@ -321,6 +321,7 @@ class LookerExportUnitTest(unittest.TestCase):
               mock.patch.object(exporter, 'run_preflight_validations'),
               mock.patch.object(exporter, 'export_database'),
               mock.patch.object(exporter, 'export_filesystem'),
+              mock.patch.object(exporter, 'generate_export_info'),
               mock.patch.object(exporter, 'generate_metadata_json'),
               mock.patch.object(exporter, 'cleanup'),
           ):
@@ -508,6 +509,40 @@ class LookerExportUnitTest(unittest.TestCase):
             stage_dir, 'missing', f'{tmpdir}/d', f'{tmpdir}/h', 'Archive error'
         )
       self.assertEqual(ctx.exception.code, 1)
+
+  def test_discover_source_infra_and_sanitize_jvm_args(self):
+    with tempfile.TemporaryDirectory() as tmpdir:
+      exp = self.exp.LookerExporter(backup_arg=tmpdir)
+      exp.db_connection_verified = True
+      fake_ps = (
+          'java -Xmx24g -Xms12g --db-password=topsecret '
+          '-p my_pwd -jar looker.jar start --clustered\n'
+      )
+      with (
+          mock.patch.object(
+              exp,
+              'run_mysql_query',
+              return_value=subprocess.CompletedProcess([], 0, stdout='4\n'),
+          ),
+          mock.patch.object(exp, '_detect_host_memory_gb', return_value=64.0),
+          mock.patch.object(
+              subprocess,
+              'run',
+              return_value=subprocess.CompletedProcess(
+                  ['ps'], 0, stdout=fake_ps
+              ),
+          ),
+      ):
+        exp.discover_source_infra()
+
+      self.assertEqual(exp.detected_replicas, 4)
+      self.assertEqual(exp.detected_memory_gb, 24.0)
+      self.assertEqual(exp.detected_limit_memory_gb, 64.0)
+      self.assertNotIn('topsecret', exp.detected_command_line_args)
+      self.assertNotIn('my_pwd', exp.detected_command_line_args)
+      self.assertIn('--db-password=REDACTED', exp.detected_command_line_args)
+      self.assertIn('-p REDACTED', exp.detected_command_line_args)
+      self.assertIn('--clustered', exp.detected_command_line_args)
 
 
 class CollectDiagnosticsTest(unittest.TestCase):
@@ -868,6 +903,8 @@ class LookerExportIntegrationTest(unittest.TestCase):
           '  print("\'canary_cipher_val\'")\n'
           'elif "closed_system" in query:\n'
           '  print("\'true\'")\n'
+          'elif "`node`" in query:\n'
+          '  print("3")\n'
       )
     os.chmod(fake_mysql, 0o700)
 
@@ -995,6 +1032,8 @@ class LookerExportIntegrationTest(unittest.TestCase):
           'fs-handle',
           'mysql-data',
           'mysql-handle',
+          'export_info.json.enc',
+          'export_info-handle.enc',
           'metadata.json',
       ):
         artifact = os.path.join(final_dir, name)
@@ -1010,6 +1049,31 @@ class LookerExportIntegrationTest(unittest.TestCase):
       self.assertEqual(
           meta['export_encryption_key']['cmek'],
           'projects/p1/locations/us-central1/keyRings/r1/cryptoKeys/k1',
+      )
+      self.assertIn('export_info.json.enc', meta['file_paths'])
+      self.assertIn('export_info-handle.enc', meta['file_paths'])
+      self.assertTrue(str(meta['exportTime']).isdigit())
+      comp_by_type = {
+          c['type']: c for c in meta['exportMetrics']['componentMetrics']
+      }
+      self.assertEqual(set(comp_by_type), {'ALL', 'DB', 'FS'})
+      self.assertGreater(comp_by_type['DB']['sizeGb'], 0)
+      self.assertEqual(
+          meta['instanceInfra']['deploymentConfigs'][0]['replicas'], 3
+      )
+      self.assertEqual(
+          meta['instanceInfra']['deploymentConfigs'][0]['type'], 'LOOKER'
+      )
+      with open(
+          os.path.join(final_dir, 'export_info.json.enc'), encoding='utf-8'
+      ) as eif:
+        export_info = json.load(eif)
+      self.assertEqual(
+          export_info['instanceInfra']['deploymentConfigs'][0]['replicas'], 3
+      )
+      self.assertEqual(
+          export_info['componentConfigs'][0]['exportType']['mysqlExportType'],
+          'MYSQLDUMP',
       )
 
       with tarfile.open(os.path.join(final_dir, 'mysql-data'), 'r:gz') as tf:
