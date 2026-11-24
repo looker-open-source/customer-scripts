@@ -232,6 +232,7 @@ are used for unset secrets when attached to a terminal):
   EXCLUDE_MARKETPLACE                                 (default: false)
   DISABLE_SCHEDULED_PLANS                             (default: true)
   LOOKER_INSTANCE_ID                                  (default: onprem-export)
+  EXPORT_INSTANCE_INFRA                               (default: true)
   LOOKER_REPLICAS          (optional override; auto-detected from node table)
   LOOKER_CPUS              (optional override; auto-detected from host vCPUs)
   LOOKER_MEMORY_GB         (optional override; auto-detected from JVM/RAM)
@@ -239,6 +240,13 @@ are used for unset secrets when attached to a terminal):
   KEEP_INTERMEDIATE_FILES                             (default: false)
   DEBUG_LOG_ENABLED                                   (default: true)
   AUTO_CONFIRM                                        (default: false)
+
+Note on source infrastructure sizing (instanceInfra in metadata.json):
+  Source replica, CPU, and memory metadata is ONLY used to upgrade Looker
+  (Google Cloud core) infrastructure based on On-Prem capacity needs (never
+  downgrading a larger target instance). If not specified (for example,
+  EXPORT_INSTANCE_INFRA=false), the import lands on the default infrastructure
+  that Looker (Google Cloud core) provides.
 
 Cryptographic helper subcommands:
   ./looker_export.py <normalize-kms-key|test-kms|verify-kek>
@@ -819,6 +827,9 @@ class LookerExporter:
     self.looker_instance_id = (
         os.environ.get('LOOKER_INSTANCE_ID') or 'onprem-export'
     )
+    self.export_instance_infra = (
+        (os.environ.get('EXPORT_INSTANCE_INFRA') or 'true').strip().lower()
+    )
     self.looker_replicas_override = (
         os.environ.get('LOOKER_REPLICAS') or ''
     ).strip()
@@ -939,6 +950,15 @@ class LookerExporter:
     self.log_error(message)
     self.cleanup(1)
 
+  @staticmethod
+  def _safe_kill_proc(proc: subprocess.Popen[Any]) -> None:
+    """Sends SIGKILL to proc, ignoring OSError if proc already exited."""
+    try:
+      proc.kill()
+    except OSError:
+      # Process exited between poll() and kill().
+      pass
+
   def _terminate_active_procs(self) -> None:
     """Terminates any running child subprocesses before directory cleanup."""
     for proc in list(self._active_procs):
@@ -948,9 +968,10 @@ class LookerExporter:
           try:
             proc.wait(timeout=5)
           except subprocess.TimeoutExpired:
-            proc.kill()
+            self._safe_kill_proc(proc)
             proc.wait()
       except OSError:
+        # Process already exited during teardown.
         pass
     self._active_procs.clear()
 
@@ -970,7 +991,7 @@ class LookerExporter:
         if proc in self._active_procs:
           self._active_procs.remove(proc)
         if proc.poll() is None:
-          proc.kill()
+          self._safe_kill_proc(proc)
           proc.wait()
 
   def _stream_command_to_encrypted_artifact(
@@ -994,7 +1015,7 @@ class LookerExporter:
         if self._cleaned_up:
           raise
         if proc.poll() is None:
-          proc.kill()
+          self._safe_kill_proc(proc)
         proc.wait()
         self.die(f'{err_msg}: {err}')
       except (
@@ -1004,14 +1025,14 @@ class LookerExporter:
           tink.TinkError,
       ) as err:
         if proc.poll() is None:
-          proc.kill()
+          self._safe_kill_proc(proc)
         proc.wait()
         self.die(f'{err_msg}: {err}')
       finally:
         if proc in self._active_procs:
           self._active_procs.remove(proc)
         if rc is None and proc.poll() is None:
-          proc.kill()
+          self._safe_kill_proc(proc)
           proc.wait()
       if rc != 0:
         self.die(err_msg)
@@ -1020,12 +1041,14 @@ class LookerExporter:
     """Returns True when pigz parallel compression is enabled and available."""
     return self.use_pigz != 'false' and shutil.which('pigz') is not None
 
-  @staticmethod
-  def _kill_and_reap(procs: Sequence[subprocess.Popen[Any] | None]) -> None:
+  @classmethod
+  def _kill_and_reap(
+      cls, procs: Sequence[subprocess.Popen[Any] | None]
+  ) -> None:
     """Terminates and reaps any still-running child processes in procs."""
     for proc in procs:
       if proc is not None and proc.poll() is None:
-        proc.kill()
+        cls._safe_kill_proc(proc)
     for proc in procs:
       if proc is not None:
         proc.wait()
@@ -1099,7 +1122,7 @@ class LookerExporter:
           if proc in self._active_procs:
             self._active_procs.remove(proc)
           if rc_val is None and proc.poll() is None:
-            proc.kill()
+            self._safe_kill_proc(proc)
             proc.wait()
 
     if tar_rc != 0 or pigz_rc != 0:
@@ -1244,8 +1267,16 @@ class LookerExporter:
     is_root = hasattr(os, 'geteuid') and os.geteuid() == 0
     interactive = self.auto_confirm != 'true' and sys.stdin.isatty()
     apt_steps = (
-        ('apt-get', 'update', '-qq'),
-        ('apt-get', 'install', '-y', '-qq', 'pigz'),
+        ('env', 'DEBIAN_FRONTEND=noninteractive', 'apt-get', 'update', '-qq'),
+        (
+            'env',
+            'DEBIAN_FRONTEND=noninteractive',
+            'apt-get',
+            'install',
+            '-y',
+            '-qq',
+            'pigz',
+        ),
     )
     pkg_managers: tuple[tuple[str, Sequence[Sequence[str]]], ...] = (
         ('apt-get', apt_steps),
@@ -2113,7 +2144,28 @@ class LookerExporter:
     return None, ''
 
   def discover_source_infra(self) -> None:
-    """Detects source Looker replica count, CPUs, memory, and startup flags."""
+    """Detects source Looker replica count, CPUs, memory, and startup flags.
+
+    Source infrastructure sizing (instanceInfra in metadata.json) is ONLY used
+    during import to upgrade Looker (Google Cloud core) infrastructure based on
+    On-Prem needs. If not specified (for example, EXPORT_INSTANCE_INFRA=false),
+    the imported instance lands on the default infrastructure that Looker Core
+    provides.
+    """
+    if self.export_instance_infra not in ('true', 'false'):
+      self.preflight_fail(
+          'Source Infrastructure',
+          "EXPORT_INSTANCE_INFRA must be 'true' or 'false' "
+          f"('{self.export_instance_infra}').",
+      )
+      return
+    if self.export_instance_infra == 'false':
+      self.log_debug(
+          'EXPORT_INSTANCE_INFRA=false; omitting instanceInfra so import '
+          'lands on the default infrastructure Looker Core provides.'
+      )
+      return
+
     replicas = 1
     if self.looker_replicas_override:
       try:
@@ -2137,9 +2189,15 @@ class LookerExporter:
         if out_str.isdigit():
           parsed_count = int(out_str)
       if parsed_count <= 0:
-        total_res = self.run_mysql_query('SELECT COUNT(*) FROM `node`;')
-        if total_res.returncode == 0:
-          out_str = (total_res.stdout or '').strip()
+        # When Looker is stopped before export, count only nodes active within
+        # 15 minutes of the latest cluster heartbeat rather than stale rows.
+        latest_cluster_res = self.run_mysql_query(
+            'SELECT COUNT(*) FROM `node` '
+            'WHERE `last_heartbeat` >= ('
+            'SELECT MAX(`last_heartbeat`) - INTERVAL 15 MINUTE FROM `node`);'
+        )
+        if latest_cluster_res.returncode == 0:
+          out_str = (latest_cluster_res.stdout or '').strip()
           if out_str.isdigit():
             parsed_count = int(out_str)
       if parsed_count > 0:
@@ -2292,6 +2350,11 @@ class LookerExporter:
       )
       self.log_info(f'  AUTO_INSTALL_PIGZ         : {self.auto_install_pigz}')
     self.log_info(
+        f'  EXPORT_INSTANCE_INFRA     : {self.export_instance_infra} '
+        '(only used to upgrade Looker Core infra based on On-Prem needs; '
+        'if not specified, lands on default Core infra)'
+    )
+    self.log_info(
         f'  KEEP_INTERMEDIATE_FILES   : {self.keep_intermediate_files}'
     )
     self.log_info(f'  DEBUG_LOG_ENABLED         : {self.debug_log_enabled}')
@@ -2316,6 +2379,18 @@ class LookerExporter:
         f'{len(self.schema_only_tables_existing)} schema-only, '
         f"plus filtered '{SETTING_DB_TABLE}'"
     )
+    if self.export_instance_infra == 'true':
+      self.log_info(
+          f'  Source Infra Sizing     : replicas={self.detected_replicas}, '
+          f'cpus={self.detected_cpus}, memory_gb={self.detected_memory_gb} GiB '
+          '(only used to upgrade Looker Core infra based on On-Prem needs; '
+          'if not specified, lands on default Core infra)'
+      )
+    else:
+      self.log_info(
+          '  Source Infra Sizing     : omitted (EXPORT_INSTANCE_INFRA=false; '
+          'import will land on default Looker Core infra)'
+      )
 
     if self.preflight_fail_count > 0:
       self.die(
@@ -3231,9 +3306,12 @@ class LookerExporter:
     )
     export_info_payload: dict[str, Any] = {
         'sourceInstance': self.looker_instance_id or 'onprem-export',
-        'instanceInfra': self._build_instance_infra_payload(),
         'componentConfigs': self._build_component_configs_payload(),
     }
+    if self.export_instance_infra == 'true':
+      export_info_payload['instanceInfra'] = (
+          self._build_instance_infra_payload()
+      )
     raw_bytes = (json.dumps(export_info_payload, indent=2) + '\n').encode(
         'utf-8'
     )
@@ -3310,7 +3388,7 @@ class LookerExporter:
     start_dt = self.export_start_dt or now_dt
     export_time_us = str(int(start_dt.timestamp() * 1_000_000))
 
-    metadata_payload = {
+    metadata_payload: dict[str, Any] = {
         'looker_instance': self.looker_instance_id or 'onprem-export',
         'looker_version': self.detected_looker_version or 'unknown',
         'export_encryption_key': {
@@ -3328,9 +3406,10 @@ class LookerExporter:
         ],
         'exportTime': export_time_us,
         'exportMetrics': self._build_export_metrics_payload(now_dt),
-        'instanceInfra': self._build_instance_infra_payload(),
         'componentConfigs': self._build_component_configs_payload(),
     }
+    if self.export_instance_infra == 'true':
+      metadata_payload['instanceInfra'] = self._build_instance_infra_payload()
     with open(out_meta, 'w', encoding='utf-8') as mf:
       json.dump(metadata_payload, mf, indent=2)
       mf.write('\n')

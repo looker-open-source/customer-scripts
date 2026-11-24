@@ -451,8 +451,26 @@ class LookerExportUnitTest(unittest.TestCase):
           cmds,
           [
               ['sudo', '-n', 'true'],
-              ['sudo', '-n', 'apt-get', 'update', '-qq'],
-              ['sudo', '-n', 'apt-get', 'install', '-y', '-qq', 'pigz'],
+              [
+                  'sudo',
+                  '-n',
+                  'env',
+                  'DEBIAN_FRONTEND=noninteractive',
+                  'apt-get',
+                  'update',
+                  '-qq',
+              ],
+              [
+                  'sudo',
+                  '-n',
+                  'env',
+                  'DEBIAN_FRONTEND=noninteractive',
+                  'apt-get',
+                  'install',
+                  '-y',
+                  '-qq',
+                  'pigz',
+              ],
           ],
       )
 
@@ -1307,6 +1325,106 @@ class LookerExportIntegrationTest(unittest.TestCase):
           self.assertEqual(tf.getnames(), ['looker'])
         with tarfile.open(os.path.join(fdir, 'fs-data'), 'r:gz') as tf:
           self.assertTrue(any(n.startswith('modelshare') for n in tf.getnames()))
+
+  def test_pr36_review_fixes_and_export_instance_infra_false(self):
+    # 1. Verify _kill_and_reap tolerates ProcessLookupError / OSError on kill().
+    class _RacyProc:
+      def __init__(self):
+        self.waited = False
+
+      def poll(self):
+        return None
+
+      def kill(self):
+        raise ProcessLookupError('No such process')
+
+      def wait(self):
+        self.waited = True
+        return 0
+
+    exp_mod = _load_module_with_stubs('looker_export', LOOKER_EXPORT_PY)
+    racy = _RacyProc()
+    exp_mod.LookerExporter._kill_and_reap((racy,))
+    self.assertTrue(racy.waited)
+
+    # 2. Verify _try_install_pigz passes env DEBIAN_FRONTEND=noninteractive
+    # inside sudo argv so sudo env_reset cannot strip it.
+    with tempfile.TemporaryDirectory() as tmpdir:
+      exp = exp_mod.LookerExporter(backup_arg=os.path.join(tmpdir, 'b'))
+      exp.auto_confirm = 'true'
+      recorded_cmds = []
+
+      def _fake_which(binary):
+        if binary == 'pigz':
+          return '/usr/bin/pigz' if len(recorded_cmds) >= 3 else None
+        if binary in ('apt-get', 'sudo'):
+          return f'/usr/bin/{binary}'
+        return None
+
+      def _fake_run(cmd, **_kwargs):
+        recorded_cmds.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+
+      with (
+          mock.patch.object(
+              exp_mod.shutil, 'which', side_effect=_fake_which
+          ),
+          mock.patch.object(
+              exp_mod.os, 'geteuid', return_value=1000
+          ),
+          mock.patch.object(
+              exp_mod.subprocess, 'run', side_effect=_fake_run
+          ),
+      ):
+        self.assertTrue(exp._try_install_pigz())
+      self.assertEqual(
+          recorded_cmds[1][:4],
+          ['sudo', '-n', 'env', 'DEBIAN_FRONTEND=noninteractive'],
+      )
+      self.assertEqual(
+          recorded_cmds[2][:4],
+          ['sudo', '-n', 'env', 'DEBIAN_FRONTEND=noninteractive'],
+      )
+
+      # 3. Verify EXPORT_INSTANCE_INFRA=false omits instanceInfra so import
+      # lands on default Looker Core infrastructure.
+      fx = self._create_hermetic_fixture(tmpdir)
+      bdir = os.path.join(tmpdir, 'backup_no_infra')
+      proc = subprocess.run(
+          [sys.executable, LOOKER_EXPORT_PY],
+          env={
+              **os.environ,
+              'PATH': f"{fx['bin_dir']}:{os.environ.get('PATH', '')}",
+              'PYTHONPATH': fx['pylib_dir'],
+              'ON_PREM_LOOKER_DATA_DIR': fx['onprem'],
+              'BACKUP_DIR': bdir,
+              'DB_HOST': '127.0.0.1',
+              'DB_PORT': '3306',
+              'DB_USER': 'looker',
+              'DB_NAME': 'looker',
+              'MYSQL_PWD': 's3cr3t_pw',
+              'LOOKER_MASTER_KEY': base64.b64encode(b'K' * 32).decode('ascii'),
+              'KMS_KEY_NAME': (
+                  'projects/p1/locations/us-central1/keyRings/r1/cryptoKeys/k1'
+              ),
+              'EXPORT_INSTANCE_INFRA': 'false',
+              'AUTO_CONFIRM': 'true',
+          },
+          check=False,
+          capture_output=True,
+          text=True,
+      )
+      self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+      self.assertIn(
+          'import will land on default Looker Core infra',
+          proc.stderr,
+      )
+      with open(
+          os.path.join(bdir, 'final_artifacts', 'metadata.json'),
+          encoding='utf-8',
+      ) as mf:
+        meta = json.load(mf)
+      self.assertNotIn('instanceInfra', meta)
 
 
 if __name__ == '__main__':
