@@ -16,7 +16,7 @@ The export tooling consists of one unified export script and one optional pre-mi
    - Verifies that `LOOKER_MASTER_KEY` unwraps the active Key-Encryption-Key (KEK) in the Looker `encryption_key` database table via RFC 3394 AES Key Unwrap.
    - Extracts your Looker backend database in a read-only, non-locking fashion using either **single-threaded (`mysqldump`)** or high-performance **multi-threaded (`mydumper` + `zstd`)** export mode, including schema/collation normalization (`utf8mb4_general_ci` and `BIGINT(19)` compatibility), schema-only export of `oauth_user_state`, optional schedule disabling (`DISABLE_SCHEDULED_PLANS`), and selective `setting` migration (`crypt_canary_gcm` and `closed_system`).
    - Stages production subdirectories from your Looker file system root path (`models`, `bare_models`, `deploy_keys`, `git_hooks`, `models-self-service`, `models-user-looker`, `remote_dependencies`, and `.persistent_store`) and normalizes Git repository and SSH configurations for `/looker_data/modelshare` in Looker (Google Cloud core).
-   - Wraps the 32-byte Looker Master Key under Cloud KMS and stream-encrypts exported `.tar.gz` archives using Tink Streaming AEAD (`AES128_CTR_HMAC_SHA256_1MB`) with Cloud KMS Envelope AEAD handles, producing `final_artifacts/` ready for upload to Cloud Storage and import into Looker (Google Cloud core).
+   - Wraps the 32-byte Looker Master Key under Cloud KMS, compresses exported `.tar.gz` archives (`mysql-data` and `fs-data`) in parallel using **`pigz`** (automatically falling back to `gzip` when unavailable), and stream-encrypts them using Tink Streaming AEAD (`AES128_CTR_HMAC_SHA256_1MB`) with Cloud KMS Envelope AEAD handles, producing `final_artifacts/` ready for upload to Cloud Storage and import into Looker (Google Cloud core).
 2. **`collect_looker_diagnostics.py` (Pre-Migration Diagnostics — Optional)**: A read-only standard-library diagnostic utility that inspects your Looker directory structure, disk usage, total database storage footprint (`total_db_bytes`, `total_db_mib`, `total_db_gib`, and estimated `1.5x` staging disk requirement), and per-table MySQL/MariaDB metadata (version, character sets, collations, and sizes sorted largest-first). It makes zero modifications to your instance.
 
 ---
@@ -24,15 +24,18 @@ The export tooling consists of one unified export script and one optional pre-mi
 ## Prerequisites
 
 ### 1. System Requirements
-- Linux operating system (for example, Debian, Ubuntu, RHEL, CentOS, or Rocky Linux) with `git >= 2.36`, `tar`, and `gzip`.
+- Linux operating system (for example, Debian, Ubuntu, RHEL, CentOS, or Rocky Linux) with `git >= 2.36`, `tar`, and `pigz` (recommended for parallel `.tar.gz` archive compression; `gzip` is supported as an automatic fallback).
 - Python `3.9` or higher.
 - Direct network access to your Looker backend database (`MySQL >= 8.0` or `MariaDB >= 10.4`) and `mysql` client CLI.
 - Free storage space on the target backup volume equal to at least `1.5x` the combined size of your Looker database and LookML directories (plus 64 MB headroom).
 
-### 2. Database Export Utilities
-Install the database dump tool corresponding to your chosen export mode:
-- **Standard Mode (Single-threaded, Default)**: Requires `mysqldump` (from `mysql-client` or `default-mysql-client`).
-- **Parallel Mode (Multi-threaded, Recommended for databases > 75 GB)**:
+### 2. Database Export & Archive Compression Utilities
+Install `pigz` for parallel archive compression alongside the database dump tool corresponding to your chosen export mode:
+- **Parallel Archive Compression (`pigz`, Recommended for all modes)**:
+  - Used automatically for both `mysqldump` and `mydumper` archive packaging (`mysql-data` and `fs-data`), utilizing all available CPU cores by default (or `PIGZ_THREADS` when set) while emitting standard `.tar.gz` archives compatible with Looker (Google Cloud core).
+  - If `pigz` is not already installed on `PATH` and `AUTO_INSTALL_PIGZ=true` (default), `looker_export.py` attempts to install `pigz` automatically via your OS package manager (`apt-get`, `dnf`, `yum`, `zypper`, `apk`, or `brew`) when root or passwordless `sudo` is available (or after interactive confirmation), and otherwise falls back cleanly to single-threaded `gzip`.
+- **Standard Mode (Single-threaded DB dump, Default)**: Requires `mysqldump` (from `mysql-client` or `default-mysql-client`).
+- **Parallel Mode (Multi-threaded DB dump, Recommended for databases > 75 GB)**:
   - `mydumper` version `0.16.0` or later (downloadable from [mydumper releases](https://github.com/mydumper/mydumper/releases) or your OS package manager).
   - `zstd` compression CLI.
 
@@ -57,25 +60,34 @@ Install the database dump tool corresponding to your chosen export mode:
 
 ## Installation
 
-1. Clone the `customer-scripts` repository on a host with access to your Looker data directory and database:
+1. Install `pigz` via your operating system package manager so archive packaging runs across multiple CPU cores:
+   ```bash
+   # Debian / Ubuntu
+   sudo apt-get update && sudo apt-get install -y pigz
+
+   # RHEL / CentOS / Rocky Linux
+   sudo dnf install -y pigz
+   ```
+
+2. Clone the `customer-scripts` repository on a host with access to your Looker data directory and database:
    ```bash
    git clone https://github.com/looker-open-source/customer-scripts.git
    cd customer-scripts/export-to-core
    ```
 
-2. Create and activate a Python virtual environment:
+3. Create and activate a Python virtual environment:
    ```bash
    python3 -m venv venv
    source venv/bin/activate
    ```
 
-3. Install the required Python cryptographic packages:
+4. Install the required Python cryptographic packages:
    ```bash
    pip install --upgrade pip
    pip install -r requirements.txt
    ```
 
-4. Ensure the scripts are executable:
+5. Ensure the scripts are executable:
    ```bash
    chmod +x looker_export.py collect_looker_diagnostics.py
    ```
@@ -145,6 +157,7 @@ export KMS_KEY_NAME="projects/<project-id>/locations/<region>/keyRings/<ring-nam
 export USE_MYDUMPER="true"
 export MYDUMPER_THREADS="8"        # Worker threads (default: 4)
 export MYDUMPER_CHUNK_ROWS="50000" # Max rows per chunk (default: 50000)
+export PIGZ_THREADS="8"            # Optional: parallel pigz threads (default: all online vCPUs)
 
 ./looker_export.py
 ```
@@ -170,9 +183,17 @@ export MYDUMPER_CHUNK_ROWS="50000" # Max rows per chunk (default: 50000)
 | `USE_MYDUMPER` (or `ENABLE_PARALLEL_EXPORT`) | Set to `true` to export the database in parallel using `mydumper` and `zstd`. | `false` |
 | `MYDUMPER_THREADS` | Number of worker threads for `mydumper` (`--threads` and `--max-threads-per-table`). | `4` |
 | `MYDUMPER_CHUNK_ROWS` | Maximum rows per table chunk when `USE_MYDUMPER=true`. | `50000` |
+| `USE_PIGZ` | Parallel `.tar.gz` compression mode for `mysql-data` and `fs-data`: `auto` (use `pigz` when available, else `gzip`), `true` (require `pigz`), or `false` (force single-threaded `gzip`). | `auto` |
+| `PIGZ_THREADS` | Optional number of compression threads passed to `pigz -p` (defaults to all online processors when unset). | `""` *(auto)* |
+| `AUTO_INSTALL_PIGZ` | Attempt to install `pigz` via the OS package manager (`apt-get`, `dnf`, `yum`, `zypper`, `apk`, `brew`) when missing on `PATH` and `USE_PIGZ` is `auto` or `true`. | `true` |
 | `EXCLUDE_MARKETPLACE` | Set to `true` to exclude Looker Marketplace directories and tables from the export. | `false` |
 | `DISABLE_SCHEDULED_PLANS` | Set `scheduled_plan.enabled = FALSE` in the exported database artifact (leaves live source DB untouched) to prevent automatic runs immediately after import. | `true` |
 | `LOOKER_INSTANCE_ID` | Optional source identifier recorded as `looker_instance` in `metadata.json`. | `onprem-export` |
+| `EXPORT_INSTANCE_INFRA` | Optional (`true` or `false`). Prompted interactively when unset. Set to `true` (or provide `LOOKER_REPLICAS`, `LOOKER_CPUS`, `LOOKER_MEMORY_GB`) to generate optional `export_info.json.enc` and `export_info-handle.enc` so Looker (Google Cloud core) can upgrade target infrastructure during import based on source capacity needs (never downgrading larger target instances). When `false` (default), those two files are omitted and the import lands on the default or existing infrastructure Looker (Google Cloud core) provides. | `false` |
+| `LOOKER_REPLICAS` | Optional source Looker node/replica count recorded in `export_info.json.enc` when `EXPORT_INSTANCE_INFRA=true` (prompted interactively when opting in; defaults to `1`). | `1` *(when enabled)* |
+| `LOOKER_CPUS` | Optional per-node vCPU count recorded in `export_info.json.enc` when `EXPORT_INSTANCE_INFRA=true` (prompted interactively when opting in). | *(optional)* |
+| `LOOKER_MEMORY_GB` | Optional per-node memory in GiB recorded in `export_info.json.enc` when `EXPORT_INSTANCE_INFRA=true` (prompted interactively when opting in). | *(optional)* |
+| `LOOKER_STARTUP_ARGS` | Optional Looker startup flags recorded in `instanceInfra.commandLineArgs` with sensitive values redacted when `EXPORT_INSTANCE_INFRA=true`. | *(optional)* |
 | `AUTO_CONFIRM` | Set to `true` to skip interactive confirmation prompts (for non-interactive automation). | `false` |
 | `DEBUG_LOG_ENABLED` | Write verbose `DEBUG` trace entries to `${BACKUP_DIR}/looker_export.log`. | `true` |
 | `KEEP_INTERMEDIATE_FILES` | Retain unencrypted staging directories under `${BACKUP_DIR}/intermediate/` after exit (debugging only). | `false` |
@@ -195,13 +216,15 @@ export MYDUMPER_CHUNK_ROWS="50000" # Max rows per chunk (default: 50000)
 
 ## Output Artifacts
 
-Upon successful completion, `looker_export.py` generates five files in `${BACKUP_DIR}/final_artifacts/`:
+Upon successful completion, `looker_export.py` generates five required files in `${BACKUP_DIR}/final_artifacts/` (plus two optional `export_info` files if you opt in to providing source infrastructure sizing):
 
 - `fs-data`: Tink Streaming AEAD-encrypted `.tar.gz` archive containing normalized LookML Git and Looker file system directories.
 - `fs-handle`: Cloud KMS envelope-encrypted Tink keyset handle (DEK) for `fs-data`.
 - `mysql-data`: Tink Streaming AEAD-encrypted `.tar.gz` archive containing the Looker database export (`mysqldump` SQL dump or `mydumper` + `zstd` archive).
 - `mysql-handle`: Cloud KMS envelope-encrypted Tink keyset handle (DEK) for `mysql-data`.
-- `metadata.json`: Export manifest containing the Looker instance identifier (`looker_instance`), detected Looker version (`looker_version`), canonical Cloud KMS CryptoKey resource (`export_encryption_key.cmek`), Cloud KMS-encrypted 32-byte Looker master key (`looker_encryption_key`), migration `source`, and exported `file_paths`.
+- `metadata.json`: Export manifest containing the Looker instance identifier (`looker_instance`), detected Looker version (`looker_version`), canonical Cloud KMS CryptoKey resource (`export_encryption_key.cmek`), Cloud KMS-encrypted 32-byte Looker master key (`looker_encryption_key`), migration `source`, exported `file_paths`, `exportTime`, and `exportMetrics` (component `sizeGb`, `duration`, `retryCount`, `startTime`, and `endTime` for `ALL`, `DB`, and `FS`).
+- `export_info.json.enc` *(Optional — generated only when opting in via interactive prompt or `EXPORT_INSTANCE_INFRA=true`)*: Tink Streaming AEAD-encrypted `ExportInfo` manifest containing `componentConfigs` and source Looker infrastructure sizing (`instanceInfra` replicas, CPUs, memory, sanitized startup args) used **only** to upgrade Looker (Google Cloud core) infrastructure during import based on source capacity needs (never downgrading larger target instances).
+- `export_info-handle.enc` *(Optional — generated only alongside `export_info.json.enc`)*: Cloud KMS envelope-encrypted Tink keyset handle (DEK) for `export_info.json.enc`.
 
 All output artifacts are created with strict owner-only permissions (`0600`).
 
@@ -209,7 +232,7 @@ All output artifacts are created with strict owner-only permissions (`0600`).
 
 ## Next Steps: Import into Looker (Google Cloud core)
 
-1. Upload the five files inside `final_artifacts/` to a dedicated folder in a Google Cloud Storage bucket in the same region as your target Looker (Google Cloud core) instance:
+1. Upload all files inside `final_artifacts/` to a dedicated folder in a Google Cloud Storage bucket in the same region as your target Looker (Google Cloud core) instance:
    ```bash
    gcloud storage cp /mnt/backups/looker_export/final_artifacts/* gs://<your-migration-bucket>/<export-folder>/
    ```

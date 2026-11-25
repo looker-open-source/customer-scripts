@@ -10,9 +10,10 @@
 Combines pre-flight environment/database/filesystem/Git validation,
 single-threaded (mysqldump) and multi-threaded (mydumper + zstd) database
 extraction, client-side SQL collation/BIGINT/setting normalization, Looker
-filesystem staging and Git repository path normalization, RFC 3394 AES Key
-Unwrap verification, Cloud KMS root key encryption, and Tink Streaming AEAD
-(AES128_CTR_HMAC_SHA256_1MB) artifact encryption in a single Python 3 script.
+filesystem staging and Git repository path normalization, multi-threaded (pigz)
+archive compression, RFC 3394 AES Key Unwrap verification, Cloud KMS root key
+encryption, and Tink Streaming AEAD (AES128_CTR_HMAC_SHA256_1MB) artifact
+encryption in a single Python 3 script.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -67,6 +69,8 @@ FS_DATA_FILE = 'fs-data'
 FS_HANDLE_FILE = 'fs-handle'
 MYSQL_DATA_FILE = 'mysql-data'
 MYSQL_HANDLE_FILE = 'mysql-handle'
+EXPORT_INFO_FILE = 'export_info.json.enc'
+EXPORT_INFO_HANDLE_FILE = 'export_info-handle.enc'
 METADATA_FILE = 'metadata.json'
 
 REQUIRED_INPUT_VARS = (
@@ -163,7 +167,7 @@ BIGINT_PATCH_SQL: Mapping[str, str] = {
     ),
 }
 
-COMMON_REQUIRED_CLI_TOOLS = ('git', 'gzip', 'mysql', 'tar')
+COMMON_REQUIRED_CLI_TOOLS = ('git', 'mysql', 'tar')
 MYSQLDUMP_REQUIRED_CLI_TOOLS = (*COMMON_REQUIRED_CLI_TOOLS, 'mysqldump')
 MYDUMPER_REQUIRED_CLI_TOOLS = (*COMMON_REQUIRED_CLI_TOOLS, 'mydumper', 'zstd')
 
@@ -195,6 +199,10 @@ _MODELS_PATH_RE = re.compile(
 )
 _ID_RSA_BAK_RE = re.compile(r'/id_rsa\.bak([\s"\']|$)', re.MULTILINE)
 _SCP_STYLE_REMOTE_RE = re.compile(r'^[^/]+@[^:]+:')
+_XMX_RE = re.compile(r'(?:^|\s)-Xmx(\d+)([kKmMgGtT])(?=\s|$)')
+_SENSITIVE_ARG_RE = re.compile(
+    r'(?i)(password|passwd|pwd|secret|token|master[_-]?key|credential|key)'
+)
 
 _USAGE_TEXT = """\
 Usage: ./looker_export.py [BACKUP_DIR]
@@ -219,12 +227,29 @@ are used for unset secrets when attached to a terminal):
   USE_MYDUMPER / ENABLE_PARALLEL_EXPORT               (default: false)
   MYDUMPER_THREADS                                    (default: 4)
   MYDUMPER_CHUNK_ROWS                                 (default: 50000)
+  USE_PIGZ                                            (default: auto)
+  PIGZ_THREADS                                        (default: all vCPUs)
+  AUTO_INSTALL_PIGZ                                   (default: true)
   EXCLUDE_MARKETPLACE                                 (default: false)
   DISABLE_SCHEDULED_PLANS                             (default: true)
   LOOKER_INSTANCE_ID                                  (default: onprem-export)
+  EXPORT_INSTANCE_INFRA                               (default: false; optional)
+  LOOKER_REPLICAS                                     (optional; default: 1)
+  LOOKER_CPUS                                         (optional vCPUs per node)
+  LOOKER_MEMORY_GB                                    (optional GiB per node)
+  LOOKER_STARTUP_ARGS                                 (optional startup flags)
   KEEP_INTERMEDIATE_FILES                             (default: false)
   DEBUG_LOG_ENABLED                                   (default: true)
   AUTO_CONFIRM                                        (default: false)
+
+Note on optional source infrastructure sizing (export_info.json.enc):
+  Providing source infrastructure sizing is completely optional (default:
+  EXPORT_INSTANCE_INFRA=false; prompted interactively when unset). When you opt
+  in, looker_export.py writes export_info.json.enc and export_info-handle.enc so
+  Looker (Google Cloud core) can upgrade target infrastructure based on your
+  source capacity needs (never downgrading a larger target instance). When
+  omitted, those two files are not generated and the import lands on the default
+  or existing infrastructure that Looker (Google Cloud core) provides.
 
 Cryptographic helper subcommands:
   ./looker_export.py <normalize-kms-key|test-kms|verify-kek>
@@ -709,6 +734,87 @@ def _resolve_env_with_alias(
   return default_value
 
 
+def _parse_jvm_xmx_gb(cmd_line: str) -> float | None:
+  """Extracts JVM -Xmx heap size in GiB from a command line, if present."""
+  match = _XMX_RE.search(cmd_line)
+  if not match:
+    return None
+  amount = int(match.group(1))
+  unit = match.group(2).lower()
+  multipliers = {
+      'k': 1.0 / (1024.0 * 1024.0),
+      'm': 1.0 / 1024.0,
+      'g': 1.0,
+      't': 1024.0,
+  }
+  return round(amount * multipliers[unit], 2)
+
+
+def _has_unclosed_quote(val: str) -> str | None:
+  """Returns the opening quote char if val starts with an unclosed quote."""
+  if val and val[0] in ('"', "'") and (len(val) == 1 or val[-1] != val[0]):
+    return val[0]
+  return None
+
+
+def _sanitize_command_line_args(raw_args: str) -> str:
+  """Redacts sensitive flag values from captured Looker startup arguments."""
+  cleaned = raw_args.strip()
+  if not cleaned:
+    return ''
+  split_failed = False
+  try:
+    tokens = shlex.split(cleaned)
+  except ValueError:
+    split_failed = True
+    tokens = cleaned.split()
+
+  sanitized: list[str] = []
+  redact_next = False
+  skip_until_quote: str | None = None
+  for tok in tokens:
+    if skip_until_quote is not None:
+      if skip_until_quote in tok:
+        skip_until_quote = None
+      continue
+    if redact_next:
+      sanitized.append('REDACTED')
+      redact_next = False
+      if split_failed:
+        skip_until_quote = _has_unclosed_quote(tok)
+      continue
+    if '=' in tok:
+      flag_name, flag_val = tok.split('=', 1)
+      if _SENSITIVE_ARG_RE.search(flag_name):
+        sanitized.append(f'{flag_name}=REDACTED')
+        if split_failed:
+          skip_until_quote = _has_unclosed_quote(flag_val)
+        continue
+    elif tok in ('-p', '--password') or (
+        tok.startswith('-') and _SENSITIVE_ARG_RE.search(tok)
+    ):
+      sanitized.append(tok)
+      redact_next = True
+      continue
+    sanitized.append(tok)
+  return ' '.join(sanitized) if split_failed else shlex.join(sanitized)
+
+
+def _format_rfc3339_utc(dt_val: datetime.datetime) -> str:
+  """Formats a UTC datetime as RFC 3339 with trailing Z."""
+  return dt_val.astimezone(datetime.timezone.utc).strftime(
+      '%Y-%m-%dT%H:%M:%SZ'
+  )
+
+
+def _format_proto_duration(
+    start_dt: datetime.datetime, end_dt: datetime.datetime
+) -> str:
+  """Formats elapsed duration between two timestamps as ProtoJSON '<sec>s'."""
+  elapsed = max(0.0, (end_dt - start_dt).total_seconds())
+  return f'{elapsed:.3f}s'
+
+
 # ==============================================================================
 # 3. Unified Export Orchestrator
 # ==============================================================================
@@ -749,6 +855,31 @@ class LookerExporter:
     self.looker_instance_id = (
         os.environ.get('LOOKER_INSTANCE_ID') or 'onprem-export'
     )
+    raw_export_infra = os.environ.get('EXPORT_INSTANCE_INFRA')
+    self.looker_replicas_override = (
+        os.environ.get('LOOKER_REPLICAS') or ''
+    ).strip()
+    self.looker_cpus_override = (os.environ.get('LOOKER_CPUS') or '').strip()
+    self.looker_memory_gb_override = (
+        os.environ.get('LOOKER_MEMORY_GB') or ''
+    ).strip()
+    self.looker_startup_args_override = (
+        os.environ.get('LOOKER_STARTUP_ARGS') or ''
+    ).strip()
+    has_explicit_sizing = bool(
+        self.looker_replicas_override
+        or self.looker_cpus_override
+        or self.looker_memory_gb_override
+    )
+    self._export_instance_infra_explicit = bool(
+        (raw_export_infra and raw_export_infra.strip()) or has_explicit_sizing
+    )
+    if raw_export_infra and raw_export_infra.strip():
+      self.export_instance_infra = raw_export_infra.strip().lower()
+    elif has_explicit_sizing:
+      self.export_instance_infra = 'true'
+    else:
+      self.export_instance_infra = 'false'
 
     self.exclude_marketplace = os.environ.get('EXCLUDE_MARKETPLACE') or 'false'
     self.disable_scheduled_plans = (
@@ -761,6 +892,11 @@ class LookerExporter:
     )
     self.mydumper_threads = os.environ.get('MYDUMPER_THREADS') or '4'
     self.mydumper_chunk_rows = os.environ.get('MYDUMPER_CHUNK_ROWS') or '50000'
+    self.use_pigz = (os.environ.get('USE_PIGZ') or 'auto').strip().lower()
+    self.pigz_threads = (os.environ.get('PIGZ_THREADS') or '').strip()
+    self.auto_install_pigz = (
+        (os.environ.get('AUTO_INSTALL_PIGZ') or 'true').strip().lower()
+    )
     self.keep_intermediate_files = (
         os.environ.get('KEEP_INTERMEDIATE_FILES') or 'false'
     )
@@ -796,6 +932,18 @@ class LookerExporter:
     self.db_connection_verified = False
     self.active_encrypted_kek = ''
     self.estimated_db_kb = 0
+    self.detected_replicas = 1
+    self.detected_cpus = float(os.cpu_count() or 1)
+    self.detected_memory_gb = 0.0
+    self.detected_limit_memory_gb = 0.0
+    self.detected_command_line_args = ''
+    self.export_start_dt: datetime.datetime | None = None
+    self.db_export_start_dt: datetime.datetime | None = None
+    self.db_export_end_dt: datetime.datetime | None = None
+    self.fs_export_start_dt: datetime.datetime | None = None
+    self.fs_export_end_dt: datetime.datetime | None = None
+    self.exported_db_bytes = 0
+    self.exported_fs_bytes = 0
     self.dumped_tables: list[str] = []
     self.excluded_tables: list[str] = []
     self.schema_only_tables_existing: list[str] = []
@@ -842,6 +990,15 @@ class LookerExporter:
     self.log_error(message)
     self.cleanup(1)
 
+  @staticmethod
+  def _safe_kill_proc(proc: subprocess.Popen[Any]) -> None:
+    """Sends SIGKILL to proc, ignoring OSError if proc already exited."""
+    try:
+      proc.kill()
+    except OSError:
+      # Process exited between poll() and kill().
+      pass
+
   def _terminate_active_procs(self) -> None:
     """Terminates any running child subprocesses before directory cleanup."""
     for proc in list(self._active_procs):
@@ -851,9 +1008,10 @@ class LookerExporter:
           try:
             proc.wait(timeout=5)
           except subprocess.TimeoutExpired:
-            proc.kill()
+            self._safe_kill_proc(proc)
             proc.wait()
       except OSError:
+        # Process already exited during teardown.
         pass
     self._active_procs.clear()
 
@@ -873,7 +1031,7 @@ class LookerExporter:
         if proc in self._active_procs:
           self._active_procs.remove(proc)
         if proc.poll() is None:
-          proc.kill()
+          self._safe_kill_proc(proc)
           proc.wait()
 
   def _stream_command_to_encrypted_artifact(
@@ -897,7 +1055,7 @@ class LookerExporter:
         if self._cleaned_up:
           raise
         if proc.poll() is None:
-          proc.kill()
+          self._safe_kill_proc(proc)
         proc.wait()
         self.die(f'{err_msg}: {err}')
       except (
@@ -907,17 +1065,108 @@ class LookerExporter:
           tink.TinkError,
       ) as err:
         if proc.poll() is None:
-          proc.kill()
+          self._safe_kill_proc(proc)
         proc.wait()
         self.die(f'{err_msg}: {err}')
       finally:
         if proc in self._active_procs:
           self._active_procs.remove(proc)
         if rc is None and proc.poll() is None:
-          proc.kill()
+          self._safe_kill_proc(proc)
           proc.wait()
       if rc != 0:
         self.die(err_msg)
+
+  def _should_use_pigz(self) -> bool:
+    """Returns True when pigz parallel compression is enabled and available."""
+    return self.use_pigz != 'false' and shutil.which('pigz') is not None
+
+  @classmethod
+  def _kill_and_reap(
+      cls, procs: Sequence[subprocess.Popen[Any] | None]
+  ) -> None:
+    """Terminates and reaps any still-running child processes in procs."""
+    for proc in procs:
+      if proc is not None and proc.poll() is None:
+        cls._safe_kill_proc(proc)
+    for proc in procs:
+      if proc is not None:
+        proc.wait()
+
+  def _stream_tar_archive_to_encrypted_artifact(
+      self,
+      stage_dir: str,
+      archive_target: str,
+      out_data: str,
+      out_handle: str,
+      err_msg: str,
+  ) -> None:
+    """Archives and compresses stage_dir/archive_target into Tink AEAD output.
+
+    Uses multi-threaded 'pigz' when enabled and available on PATH, falling back
+    to single-threaded 'tar -czf -' (gzip) otherwise, and verifies exit codes
+    of both 'tar' and 'pigz'.
+    """
+    if not self._should_use_pigz():
+      if self.use_pigz == 'true':
+        self.die(
+            f"{err_msg}: 'pigz' is not available on PATH while USE_PIGZ=true."
+        )
+      cmd = ['tar', '-czf', '-', '-C', stage_dir, archive_target]
+      self._stream_command_to_encrypted_artifact(
+          cmd, out_data, out_handle, err_msg
+      )
+      return
+
+    tar_cmd = ['tar', '-cf', '-', '-C', stage_dir, archive_target]
+    pigz_cmd = ['pigz', '-c']
+    if self.pigz_threads:
+      pigz_cmd.extend(['-p', str(self.pigz_threads)])
+    self.log_debug(
+        f"Streaming archive '{archive_target}' via pigz "
+        f"(threads={self.pigz_threads or 'auto'}) -> '{out_data}'..."
+    )
+    tar_proc: subprocess.Popen[Any] | None = None
+    pigz_proc: subprocess.Popen[Any] | None = None
+    tar_rc: int | None = None
+    pigz_rc: int | None = None
+    try:
+      tar_proc = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE)
+      self._active_procs.append(tar_proc)
+      if tar_proc.stdout is None:
+        self.die(err_msg)
+      pigz_proc = subprocess.Popen(
+          pigz_cmd, stdin=tar_proc.stdout, stdout=subprocess.PIPE
+      )
+      self._active_procs.append(pigz_proc)
+      tar_proc.stdout.close()  # Ensure tar receives SIGPIPE if pigz exits.
+      if pigz_proc.stdout is None:
+        self.die(err_msg)
+      stream_encrypt(out_data, out_handle, input_stream=pigz_proc.stdout)
+      pigz_proc.stdout.close()
+      pigz_rc = pigz_proc.wait()
+      tar_rc = tar_proc.wait()
+    except SystemExit as err:
+      if self._cleaned_up:
+        raise
+      self._kill_and_reap((pigz_proc, tar_proc))
+      self.die(f'{err_msg}: {err}')
+    except (OSError, ValueError, RuntimeError, tink.TinkError) as err:
+      self._kill_and_reap((pigz_proc, tar_proc))
+      self.die(f'{err_msg}: {err}')
+    finally:
+      for proc, rc_val in ((pigz_proc, pigz_rc), (tar_proc, tar_rc)):
+        if proc is not None:
+          if proc.stdout is not None and not proc.stdout.closed:
+            proc.stdout.close()
+          if proc in self._active_procs:
+            self._active_procs.remove(proc)
+          if rc_val is None and proc.poll() is None:
+            self._safe_kill_proc(proc)
+            proc.wait()
+
+    if tar_rc != 0 or pigz_rc != 0:
+      self.die(f'{err_msg} (tar exit={tar_rc}, pigz exit={pigz_rc}).')
 
   def _perform_cleanup(self, exit_code: int) -> None:
     """Terminates child processes, scrubs secrets, and removes staging dirs."""
@@ -993,6 +1242,47 @@ class LookerExporter:
       os.environ[env_name] = secret_value
     return secret_value
 
+  def _prompt_line(self, prompt_text: str) -> str:
+    """Writes an interactive prompt to stderr and reads one line from stdin."""
+    sys.stderr.write(f'  [PROMPT] {prompt_text}')
+    sys.stderr.flush()
+    try:
+      return sys.stdin.readline().strip()
+    except OSError:
+      return ''
+
+  def _prompt_optional_instance_infra(self) -> None:
+    """Optionally asks interactive users for source Looker sizing to upscale."""
+    if self.auto_confirm == 'true' or not sys.stdin.isatty():
+      return
+    if not self._export_instance_infra_explicit:
+      reply = self._prompt_line(
+          'Optional: Provide source Looker node sizing (replicas, vCPUs, '
+          'memory GiB) so Looker Core can upscale target infrastructure '
+          'during import if needed? [y/N]: '
+      )
+      if not re.fullmatch(r'[Yy]([Ee][Ss])?', reply):
+        self.export_instance_infra = 'false'
+        return
+      self.export_instance_infra = 'true'
+      self._export_instance_infra_explicit = True
+
+    if self.export_instance_infra != 'true':
+      return
+    if not self.looker_replicas_override:
+      rep_ans = self._prompt_line(
+          'Enter source Looker node/replica count (LOOKER_REPLICAS) [1]: '
+      )
+      self.looker_replicas_override = rep_ans or '1'
+    if not self.looker_cpus_override:
+      self.looker_cpus_override = self._prompt_line(
+          'Enter vCPUs per Looker node (LOOKER_CPUS, e.g. 8): '
+      )
+    if not self.looker_memory_gb_override:
+      self.looker_memory_gb_override = self._prompt_line(
+          'Enter memory in GiB per Looker node (LOOKER_MEMORY_GB, e.g. 32): '
+      )
+
   def validate_environment(self) -> None:
     """Validates required input and secret environment variables."""
     self.mysql_pwd = self._prompt_secret_if_missing(
@@ -1006,6 +1296,7 @@ class LookerExporter:
     self.kms_key_name = self._prompt_secret_if_missing(
         self.kms_key_name, 'KMS_KEY_NAME', 'GCP Cloud KMS Key URI'
     )
+    self._prompt_optional_instance_infra()
 
     var_map = {
         'ON_PREM_LOOKER_DATA_PATH': self.on_prem_looker_data_path,
@@ -1049,6 +1340,162 @@ class LookerExporter:
           'Tools',
           f"All required CLI binaries ({' '.join(required_tools)}) are "
           'available on PATH.',
+      )
+
+  def _try_install_pigz(self) -> bool:
+    """Attempts to install 'pigz' via the OS package manager when missing."""
+    if shutil.which('pigz') is not None:
+      return True
+    is_root = hasattr(os, 'geteuid') and os.geteuid() == 0
+    interactive = self.auto_confirm != 'true' and sys.stdin.isatty()
+    apt_steps = (
+        ('env', 'DEBIAN_FRONTEND=noninteractive', 'apt-get', 'update', '-qq'),
+        (
+            'env',
+            'DEBIAN_FRONTEND=noninteractive',
+            'apt-get',
+            'install',
+            '-y',
+            '-qq',
+            'pigz',
+        ),
+    )
+    pkg_managers: tuple[tuple[str, Sequence[Sequence[str]]], ...] = (
+        ('apt-get', apt_steps),
+        ('dnf', (('dnf', 'install', '-y', '-q', 'pigz'),)),
+        ('yum', (('yum', 'install', '-y', '-q', 'pigz'),)),
+        ('zypper', (('zypper', '--non-interactive', 'install', 'pigz'),)),
+        ('apk', (('apk', 'add', '--no-cache', 'pigz'),)),
+    )
+    mgr, steps, needs_root = next(
+        ((m, s, True) for m, s in pkg_managers if shutil.which(m)),
+        (None, (), True),
+    )
+    if not mgr and not is_root and shutil.which('brew'):
+      mgr, steps, needs_root = 'brew', (('brew', 'install', 'pigz'),), False
+    if not mgr:
+      return False
+
+    sudo_prefix: tuple[str, ...] = ()
+    if needs_root and not is_root:
+      if not shutil.which('sudo'):
+        return False
+      if not interactive:
+        try:
+          probe = subprocess.run(
+              ['sudo', '-n', 'true'],
+              check=False,
+              stdin=subprocess.DEVNULL,
+              stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL,
+              timeout=5,
+          )
+        except (OSError, subprocess.SubprocessError):
+          return False
+        if probe.returncode != 0:
+          return False
+        sudo_prefix = ('sudo', '-n')
+      else:
+        sudo_prefix = ('sudo',)
+
+    if interactive:
+      sys.stderr.write(
+          f"  [PROMPT] Install 'pigz' via '{mgr}' for parallel compression? "
+          '[y/N]: '
+      )
+      sys.stderr.flush()
+      if not re.fullmatch(r'[Yy]([Ee][Ss])?', sys.stdin.readline().strip()):
+        return False
+
+    self.log_info(f"Installing 'pigz' via '{mgr}' for parallel compression...")
+    cmd_env = {**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'}
+    for step in steps:
+      full_cmd = [*sudo_prefix, *step]
+      try:
+        proc = subprocess.run(
+            full_cmd,
+            check=False,
+            env=cmd_env if mgr == 'apt-get' else None,
+            stdin=None if interactive else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+        )
+      except (OSError, subprocess.SubprocessError) as err:
+        self.log_warn(f"Failed executing '{' '.join(full_cmd)}': {err}")
+        return False
+      if proc.returncode != 0:
+        self.log_warn(
+            f"Command '{' '.join(full_cmd)}' failed (exit {proc.returncode})."
+        )
+        return False
+    if shutil.which('pigz') is not None:
+      self.log_info("Successfully installed 'pigz'.")
+      return True
+    return False
+
+  def validate_pigz(self) -> None:
+    """Validates USE_PIGZ/PIGZ_THREADS and installs or resolves pigz/gzip."""
+    if self.use_pigz not in ('auto', 'true', 'false'):
+      self.preflight_fail(
+          'Compression',
+          f"USE_PIGZ must be 'auto', 'true', or 'false' ('{self.use_pigz}').",
+      )
+      return
+    if self.auto_install_pigz not in ('true', 'false'):
+      self.preflight_fail(
+          'Compression',
+          "AUTO_INSTALL_PIGZ must be 'true' or 'false' "
+          f"('{self.auto_install_pigz}').",
+      )
+      return
+    if self.pigz_threads and not re.fullmatch(r'[1-9]\d*', self.pigz_threads):
+      self.preflight_fail(
+          'Compression',
+          f"PIGZ_THREADS must be an integer >= 1 ('{self.pigz_threads}').",
+      )
+      return
+    if self.use_pigz == 'false':
+      if shutil.which('gzip'):
+        self.preflight_pass(
+            'Compression',
+            "Single-threaded 'gzip' archive compression enabled "
+            '(USE_PIGZ=false).',
+        )
+      else:
+        self.preflight_fail(
+            'Compression',
+            "Missing required CLI binary 'gzip' on PATH when USE_PIGZ=false.",
+        )
+      return
+
+    if shutil.which('pigz') is None and self.auto_install_pigz == 'true':
+      self._try_install_pigz()
+    if shutil.which('pigz') is not None:
+      self.preflight_pass(
+          'Compression',
+          "Parallel archive compression enabled with 'pigz' "
+          f"(threads={self.pigz_threads or 'auto'}).",
+      )
+    elif self.use_pigz == 'true':
+      self.preflight_fail(
+          'Compression',
+          "Missing required CLI binary 'pigz' on PATH when USE_PIGZ=true "
+          "(install 'pigz' or set USE_PIGZ=false).",
+      )
+    elif shutil.which('gzip') is not None:
+      self.log_info(
+          "'pigz' not found on PATH; falling back to single-threaded 'gzip' "
+          "compression (install 'pigz' for faster multi-core packaging)."
+      )
+      self.preflight_pass(
+          'Compression',
+          "Single-threaded 'gzip' archive compression available on PATH.",
+      )
+    else:
+      self.preflight_fail(
+          'Compression', "Neither 'pigz' nor 'gzip' is available on PATH."
       )
 
   def validate_mydumper(self) -> None:
@@ -1734,6 +2181,175 @@ class LookerExporter:
         f"plus filtered '{SETTING_DB_TABLE}'.",
     )
 
+  def _detect_host_memory_gb(self) -> float:
+    """Returns total host physical RAM in GiB from /proc/meminfo or sysconf."""
+    try:
+      if os.path.isfile('/proc/meminfo'):
+        with open('/proc/meminfo', encoding='utf-8') as mem_file:
+          for line in mem_file:
+            if line.startswith('MemTotal:'):
+              parts = line.split()
+              if len(parts) >= 2 and parts[1].isdigit():
+                return round(int(parts[1]) / (1024.0 * 1024.0), 2)
+    except OSError:
+      pass
+    try:
+      page_size = os.sysconf('SC_PAGE_SIZE')
+      phys_pages = os.sysconf('SC_PHYS_PAGES')
+      if isinstance(page_size, int) and isinstance(phys_pages, int):
+        if page_size > 0 and phys_pages > 0:
+          return round((page_size * phys_pages) / float(1024**3), 2)
+    except (AttributeError, OSError, ValueError):
+      pass
+    return 0.0
+
+  def _detect_running_looker_jvm(self) -> tuple[float | None, str]:
+    """Inspects local processes for a running Looker JVM (-Xmx & args)."""
+    if not shutil.which('ps'):
+      return None, ''
+    try:
+      res = subprocess.run(
+          ['ps', '-eo', 'args'],
+          check=False,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.DEVNULL,
+          text=True,
+      )
+    except OSError:
+      return None, ''
+    if res.returncode != 0 or not res.stdout:
+      return None, ''
+    for raw_line in res.stdout.splitlines():
+      line = raw_line.strip()
+      if 'java' in line and 'looker.jar' in line:
+        return _parse_jvm_xmx_gb(line), _sanitize_command_line_args(line)
+    return None, ''
+
+  def discover_source_infra(self) -> None:
+    """Detects source Looker replica count, CPUs, memory, and startup flags.
+
+    Source infrastructure sizing (instanceInfra in export_info.json.enc) is ONLY
+    used during import to upgrade Looker (Google Cloud core) infrastructure
+    based on On-Prem needs. If not specified (for example,
+    EXPORT_INSTANCE_INFRA=false), the imported instance lands on the default
+    infrastructure that Looker Core provides.
+    """
+    if self.export_instance_infra not in ('true', 'false'):
+      self.preflight_fail(
+          'Source Infrastructure',
+          "EXPORT_INSTANCE_INFRA must be 'true' or 'false' "
+          f"('{self.export_instance_infra}').",
+      )
+      return
+    if self.export_instance_infra == 'false':
+      self.log_debug(
+          'EXPORT_INSTANCE_INFRA=false; omitting instanceInfra so import '
+          'lands on the default infrastructure Looker Core provides.'
+      )
+      return
+
+    replicas = 1
+    if self.looker_replicas_override:
+      try:
+        replicas = max(1, int(self.looker_replicas_override))
+      except ValueError:
+        self.preflight_warn(
+            'Source Infrastructure',
+            f"Invalid LOOKER_REPLICAS='{self.looker_replicas_override}'; "
+            'falling back to database node discovery.',
+        )
+        self.looker_replicas_override = ''
+
+    if not self.looker_replicas_override and self.db_connection_verified:
+      active_res = self.run_mysql_query(
+          'SELECT COUNT(*) FROM `node` '
+          'WHERE `last_heartbeat` >= NOW() - INTERVAL 15 MINUTE;'
+      )
+      parsed_count = 0
+      if active_res.returncode == 0:
+        out_str = (active_res.stdout or '').strip()
+        if out_str.isdigit():
+          parsed_count = int(out_str)
+      if parsed_count <= 0:
+        # When Looker is stopped before export, count only nodes active within
+        # 15 minutes of the latest cluster heartbeat rather than stale rows.
+        latest_cluster_res = self.run_mysql_query(
+            'SELECT COUNT(*) FROM `node` '
+            'WHERE `last_heartbeat` >= ('
+            'SELECT MAX(`last_heartbeat`) - INTERVAL 15 MINUTE FROM `node`);'
+        )
+        if latest_cluster_res.returncode == 0:
+          out_str = (latest_cluster_res.stdout or '').strip()
+          if out_str.isdigit():
+            parsed_count = int(out_str)
+      if parsed_count > 0:
+        replicas = parsed_count
+    self.detected_replicas = max(1, replicas)
+
+    cpus = float(os.cpu_count() or 1)
+    if self.looker_cpus_override:
+      try:
+        cpus = max(0.1, float(self.looker_cpus_override))
+      except ValueError:
+        self.preflight_warn(
+            'Source Infrastructure',
+            f"Invalid LOOKER_CPUS='{self.looker_cpus_override}'; "
+            f'using host vCPU count ({cpus}).',
+        )
+    self.detected_cpus = round(cpus, 2)
+
+    host_mem_gb = self._detect_host_memory_gb()
+    jvm_xmx_gb, jvm_cmd_args = self._detect_running_looker_jvm()
+    mem_gb = jvm_xmx_gb if jvm_xmx_gb is not None else host_mem_gb
+    memory_overridden = False
+    if self.looker_memory_gb_override:
+      try:
+        mem_gb = max(0.1, float(self.looker_memory_gb_override))
+        memory_overridden = True
+      except ValueError:
+        self.preflight_warn(
+            'Source Infrastructure',
+            f"Invalid LOOKER_MEMORY_GB='{self.looker_memory_gb_override}'; "
+            f'using detected memory ({mem_gb} GiB).',
+        )
+    self.detected_memory_gb = round(mem_gb, 2)
+    self.detected_limit_memory_gb = (
+        round(mem_gb, 2)
+        if memory_overridden
+        else round(max(host_mem_gb, mem_gb), 2)
+    )
+
+    if self.looker_startup_args_override:
+      self.detected_command_line_args = _sanitize_command_line_args(
+          self.looker_startup_args_override
+      )
+    else:
+      self.detected_command_line_args = jvm_cmd_args
+
+    self.log_debug(
+        'Detected source Looker infrastructure: '
+        f'replicas={self.detected_replicas}, cpus={self.detected_cpus}, '
+        f'memory_gb={self.detected_memory_gb}, '
+        f'limit_memory_gb={self.detected_limit_memory_gb}'
+    )
+
+  @staticmethod
+  def _calculate_dir_size_bytes(target_dir: str) -> int:
+    """Computes total bytes of regular non-symlink files in target_dir."""
+    if not target_dir or not os.path.isdir(target_dir):
+      return 0
+    total = 0
+    for root, _, files in os.walk(target_dir, followlinks=False):
+      for f_name in files:
+        f_full = os.path.join(root, f_name)
+        if os.path.islink(f_full):
+          continue
+        try:
+          total += os.lstat(f_full).st_size
+        except OSError:
+          pass
+    return total
+
   def _calculate_fs_size_kb(self) -> int:
     """Computes total uncompressed size (in KB) of allowed Looker subdirs."""
     if not self.on_prem_real_path:
@@ -1815,6 +2431,17 @@ class LookerExporter:
     if self.use_mydumper == 'true':
       self.log_info(f'  MYDUMPER_THREADS          : {self.mydumper_threads}')
       self.log_info(f'  MYDUMPER_CHUNK_ROWS       : {self.mydumper_chunk_rows}')
+    self.log_info(f'  USE_PIGZ                  : {self.use_pigz}')
+    if self.use_pigz != 'false':
+      self.log_info(
+          f"  PIGZ_THREADS              : {self.pigz_threads or 'auto'}"
+      )
+      self.log_info(f'  AUTO_INSTALL_PIGZ         : {self.auto_install_pigz}')
+    self.log_info(
+        f'  EXPORT_INSTANCE_INFRA     : {self.export_instance_infra} '
+        '(only used to upgrade Looker Core infra based on On-Prem needs; '
+        'if not specified, lands on default Core infra)'
+    )
     self.log_info(
         f'  KEEP_INTERMEDIATE_FILES   : {self.keep_intermediate_files}'
     )
@@ -1840,6 +2467,18 @@ class LookerExporter:
         f'{len(self.schema_only_tables_existing)} schema-only, '
         f"plus filtered '{SETTING_DB_TABLE}'"
     )
+    if self.export_instance_infra == 'true':
+      self.log_info(
+          f'  Source Infra Sizing     : replicas={self.detected_replicas}, '
+          f'cpus={self.detected_cpus}, memory_gb={self.detected_memory_gb} GiB '
+          '(only used to upgrade Looker Core infra based on On-Prem needs; '
+          'if not specified, lands on default Core infra)'
+      )
+    else:
+      self.log_info(
+          '  Source Infra Sizing     : omitted (EXPORT_INSTANCE_INFRA=false; '
+          'import will land on default Looker Core infra)'
+      )
 
     if self.preflight_fail_count > 0:
       self.die(
@@ -1886,6 +2525,7 @@ class LookerExporter:
     self.print_normalized_inputs_and_confirm()
 
     self.validate_cli_tools()
+    self.validate_pigz()
     self.validate_mydumper()
     self.validate_git_version()
     self.validate_python_environment()
@@ -1896,6 +2536,7 @@ class LookerExporter:
     self.validate_looker_version()
     self.validate_master_key_kek()
     self.discover_database_tables()
+    self.discover_source_infra()
     self.validate_free_diskspace()
 
     self.print_validation_summary_and_confirm()
@@ -2191,17 +2832,17 @@ class LookerExporter:
 
     self.log_debug(
         f'Packaging and encrypting MySQL database archive ({MYSQL_DATA_FILE}, '
-        f'USE_MYDUMPER={self.use_mydumper})...'
+        f'USE_MYDUMPER={self.use_mydumper}, USE_PIGZ={self.use_pigz})...'
     )
     if self.use_mydumper == 'true':
-      cmd = ['tar', '-czf', '-', '-C', self.mysql_stage_dir, '.']
+      archive_target = '.'
       err_msg = 'Failed to package and encrypt mydumper database archive.'
     else:
-      cmd = ['tar', '-czf', '-', '-C', self.mysql_stage_dir, 'looker']
+      archive_target = 'looker'
       err_msg = 'Failed to package and encrypt database dump.'
 
-    self._stream_command_to_encrypted_artifact(
-        cmd, out_data, out_handle, err_msg
+    self._stream_tar_archive_to_encrypted_artifact(
+        self.mysql_stage_dir, archive_target, out_data, out_handle, err_msg
     )
 
     if self.keep_intermediate_files != 'true':
@@ -2209,6 +2850,7 @@ class LookerExporter:
 
   def export_database(self) -> None:
     """Exports and encrypts the Looker MySQL/MariaDB database."""
+    self.db_export_start_dt = datetime.datetime.now(datetime.timezone.utc)
     os.makedirs(self.mysql_stage_dir, exist_ok=True)
     self.log_info(
         f"Exporting and encrypting database '{self.db_name}' "
@@ -2218,7 +2860,10 @@ class LookerExporter:
       self.export_database_with_mydumper()
     else:
       self.export_database_with_mysqldump()
+    staged_db_bytes = self._calculate_dir_size_bytes(self.mysql_stage_dir)
+    self.exported_db_bytes = max(staged_db_bytes, self.estimated_db_kb * 1024)
     self.encrypt_database_dump()
+    self.db_export_end_dt = datetime.datetime.now(datetime.timezone.utc)
     self.log_info(
         f'Database export completed ({MYSQL_DATA_FILE}, {MYSQL_HANDLE_FILE}).'
     )
@@ -2668,11 +3313,12 @@ class LookerExporter:
     out_handle = os.path.join(self.final_artifacts_dir, FS_HANDLE_FILE)
 
     self.log_debug(
-        f'Packaging and encrypting filesystem archive ({FS_DATA_FILE})...'
+        f'Packaging and encrypting filesystem archive ({FS_DATA_FILE}, '
+        f'USE_PIGZ={self.use_pigz})...'
     )
-    cmd = ['tar', '-czf', '-', '-C', self.intermediate_dir, 'modelshare']
-    self._stream_command_to_encrypted_artifact(
-        cmd,
+    self._stream_tar_archive_to_encrypted_artifact(
+        self.intermediate_dir,
+        'modelshare',
         out_data,
         out_handle,
         'Failed to package and encrypt filesystem archive.',
@@ -2680,13 +3326,16 @@ class LookerExporter:
 
   def export_filesystem(self) -> None:
     """Stages, prunes, normalizes Git repos, and encrypts the filesystem."""
+    self.fs_export_start_dt = datetime.datetime.now(datetime.timezone.utc)
     self.log_info(
         'Exporting, normalizing, and encrypting Looker filesystem...'
     )
     self.stage_filesystem()
     self.prune_staging_filesystem()
     self.normalize_git_repositories()
+    self.exported_fs_bytes = self._calculate_dir_size_bytes(self.fs_stage_dir)
     self.package_filesystem()
+    self.fs_export_end_dt = datetime.datetime.now(datetime.timezone.utc)
     self.log_info(
         f'Filesystem export completed ({FS_DATA_FILE}, {FS_HANDLE_FILE}).'
     )
@@ -2694,6 +3343,122 @@ class LookerExporter:
   # ============================================================================
   # Metadata Generation & Main Execution
   # ============================================================================
+  def _build_instance_infra_payload(self) -> dict[str, Any]:
+    """Builds InstanceInfra JSON payload matching export_info.proto."""
+    deployment_cfg: dict[str, Any] = {
+        'type': 'LOOKER',
+        'cpus': self.detected_cpus,
+        'memoryGb': self.detected_memory_gb,
+        'replicas': self.detected_replicas,
+        'limitCpu': self.detected_cpus,
+        'limitMemoryGb': self.detected_limit_memory_gb,
+    }
+    infra_payload: dict[str, Any] = {
+        'deploymentConfigs': [deployment_cfg],
+    }
+    if self.detected_command_line_args:
+      infra_payload['commandLineArgs'] = self.detected_command_line_args
+    return infra_payload
+
+  def _build_component_configs_payload(self) -> list[dict[str, Any]]:
+    """Builds ComponentConfig list matching export_info.proto."""
+    mysql_export_type = (
+        'MYDUMPER' if self.use_mydumper == 'true' else 'MYSQLDUMP'
+    )
+    return [
+        {
+            'type': 'DB',
+            'identifier': self.db_name,
+            'exportType': {
+                'mysqlExportType': mysql_export_type,
+            },
+        },
+        {
+            'type': 'FS',
+            'identifier': (
+                self.on_prem_real_path or self.on_prem_looker_data_path
+            ),
+            'exportType': {
+                'filesystemExportType': 'ARCHIVE',
+            },
+        },
+    ]
+
+  def generate_export_info(self) -> None:
+    """Encrypts optional ExportInfo when EXPORT_INSTANCE_INFRA=true."""
+    if self.export_instance_infra != 'true':
+      return
+    out_data = os.path.join(self.final_artifacts_dir, EXPORT_INFO_FILE)
+    out_handle = os.path.join(self.final_artifacts_dir, EXPORT_INFO_HANDLE_FILE)
+    self.log_info(
+        f'Generating optional encrypted source infrastructure metadata '
+        f'({EXPORT_INFO_FILE}, {EXPORT_INFO_HANDLE_FILE})...'
+    )
+    export_info_payload: dict[str, Any] = {
+        'sourceInstance': self.looker_instance_id or 'onprem-export',
+        'componentConfigs': self._build_component_configs_payload(),
+        'instanceInfra': self._build_instance_infra_payload(),
+    }
+    raw_bytes = (json.dumps(export_info_payload, indent=2) + '\n').encode(
+        'utf-8'
+    )
+    try:
+      stream_encrypt(
+          out_data, out_handle, input_stream=io.BytesIO(raw_bytes)
+      )
+    except (
+        SystemExit,
+        Exception,  # pylint: disable=broad-exception-caught
+    ) as err:
+      self.die(f'Failed to encrypt export info metadata: {err}')
+
+  def _build_export_metrics_payload(
+      self, now_dt: datetime.datetime
+  ) -> dict[str, Any]:
+    """Builds ExportMetrics JSON payload matching export_metadata.proto."""
+    overall_start = self.export_start_dt or self.db_export_start_dt or now_dt
+    db_start = self.db_export_start_dt or overall_start
+    db_end = self.db_export_end_dt or now_dt
+    fs_start = self.fs_export_start_dt or db_end
+    fs_end = self.fs_export_end_dt or now_dt
+
+    gib = float(1024**3)
+    db_size_gb = round(self.exported_db_bytes / gib, 6)
+    fs_size_gb = round(self.exported_fs_bytes / gib, 6)
+    all_size_gb = round(
+        (self.exported_db_bytes + self.exported_fs_bytes) / gib, 6
+    )
+
+    return {
+        'instanceInternalName': self.looker_instance_id or 'onprem-export',
+        'componentMetrics': [
+            {
+                'type': 'ALL',
+                'sizeGb': all_size_gb,
+                'duration': _format_proto_duration(overall_start, now_dt),
+                'retryCount': 0,
+                'startTime': _format_rfc3339_utc(overall_start),
+                'endTime': _format_rfc3339_utc(now_dt),
+            },
+            {
+                'type': 'DB',
+                'sizeGb': db_size_gb,
+                'duration': _format_proto_duration(db_start, db_end),
+                'retryCount': 0,
+                'startTime': _format_rfc3339_utc(db_start),
+                'endTime': _format_rfc3339_utc(db_end),
+            },
+            {
+                'type': 'FS',
+                'sizeGb': fs_size_gb,
+                'duration': _format_proto_duration(fs_start, fs_end),
+                'retryCount': 0,
+                'startTime': _format_rfc3339_utc(fs_start),
+                'endTime': _format_rfc3339_utc(fs_end),
+            },
+        ],
+    }
+
   def generate_metadata_json(self) -> None:
     """Writes final_artifacts/metadata.json compatible with Looker Core SLM."""
     out_meta = os.path.join(self.final_artifacts_dir, METADATA_FILE)
@@ -2706,7 +3471,20 @@ class LookerExporter:
       self.die(f'Failed to generate encryption metadata: {err}')
       return
 
-    metadata_payload = {
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    start_dt = self.export_start_dt or now_dt
+    export_time_us = str(int(start_dt.timestamp() * 1_000_000))
+
+    file_paths = [
+        FS_DATA_FILE,
+        FS_HANDLE_FILE,
+        MYSQL_DATA_FILE,
+        MYSQL_HANDLE_FILE,
+    ]
+    if self.export_instance_infra == 'true':
+      file_paths.extend([EXPORT_INFO_FILE, EXPORT_INFO_HANDLE_FILE])
+
+    metadata_payload: dict[str, Any] = {
         'looker_instance': self.looker_instance_id or 'onprem-export',
         'looker_version': self.detected_looker_version or 'unknown',
         'export_encryption_key': {
@@ -2714,12 +3492,9 @@ class LookerExporter:
         },
         'looker_encryption_key': encrypted_master_key,
         'source': 'LOOKER_ORIGINAL',
-        'file_paths': [
-            FS_DATA_FILE,
-            FS_HANDLE_FILE,
-            MYSQL_DATA_FILE,
-            MYSQL_HANDLE_FILE,
-        ],
+        'file_paths': file_paths,
+        'exportTime': export_time_us,
+        'exportMetrics': self._build_export_metrics_payload(now_dt),
     }
     with open(out_meta, 'w', encoding='utf-8') as mf:
       json.dump(metadata_payload, mf, indent=2)
@@ -2758,8 +3533,10 @@ class LookerExporter:
       os.chmod(self.intermediate_dir, 0o700)
       os.chmod(self.final_artifacts_dir, 0o700)
 
+      self.export_start_dt = datetime.datetime.now(datetime.timezone.utc)
       self.export_database()
       self.export_filesystem()
+      self.generate_export_info()
       self.generate_metadata_json()
 
       self.log_info('=== Looker Migration Export Completed Successfully ===')
