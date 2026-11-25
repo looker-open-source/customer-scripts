@@ -1076,18 +1076,18 @@ class LookerExportIntegrationTest(unittest.TestCase):
       }
       self.assertEqual(set(comp_by_type), {'ALL', 'DB', 'FS'})
       self.assertGreater(comp_by_type['DB']['sizeGb'], 0)
-      self.assertEqual(
-          meta['instanceInfra']['deploymentConfigs'][0]['replicas'], 3
-      )
-      self.assertEqual(
-          meta['instanceInfra']['deploymentConfigs'][0]['type'], 'LOOKER'
-      )
+      self.assertTrue(comp_by_type['ALL']['duration'].endswith('s'))
+      self.assertNotIn('instanceInfra', meta)
+      self.assertNotIn('componentConfigs', meta)
       with open(
           os.path.join(final_dir, 'export_info.json.enc'), encoding='utf-8'
       ) as eif:
         export_info = json.load(eif)
       self.assertEqual(
           export_info['instanceInfra']['deploymentConfigs'][0]['replicas'], 3
+      )
+      self.assertEqual(
+          export_info['instanceInfra']['deploymentConfigs'][0]['type'], 'LOOKER'
       )
       self.assertEqual(
           export_info['componentConfigs'][0]['exportType']['mysqlExportType'],
@@ -1425,6 +1425,14 @@ class LookerExportIntegrationTest(unittest.TestCase):
       ) as mf:
         meta = json.load(mf)
       self.assertNotIn('instanceInfra', meta)
+      self.assertIn('exportMetrics', meta)
+      with open(
+          os.path.join(bdir, 'final_artifacts', 'export_info.json.enc'),
+          encoding='utf-8',
+      ) as eif:
+        export_info = json.load(eif)
+      self.assertNotIn('instanceInfra', export_info)
+      self.assertIn('componentConfigs', export_info)
 
 
 if __name__ == '__main__':

@@ -189,7 +189,7 @@ export PIGZ_THREADS="8"            # Optional: parallel pigz threads (default: a
 | `EXCLUDE_MARKETPLACE` | Set to `true` to exclude Looker Marketplace directories and tables from the export. | `false` |
 | `DISABLE_SCHEDULED_PLANS` | Set `scheduled_plan.enabled = FALSE` in the exported database artifact (leaves live source DB untouched) to prevent automatic runs immediately after import. | `true` |
 | `LOOKER_INSTANCE_ID` | Optional source identifier recorded as `looker_instance` in `metadata.json`. | `onprem-export` |
-| `EXPORT_INSTANCE_INFRA` | Set to `true` to include source infrastructure sizing (`instanceInfra` in `metadata.json` and `export_info.json.enc`). **Note:** `instanceInfra` is **only** used to upgrade Looker (Google Cloud core) infrastructure based on customer-hosted (On-Prem) capacity needs (never downgrading larger target instances); if not specified (`EXPORT_INSTANCE_INFRA=false`), the import lands on the default infrastructure that Looker (Google Cloud core) provides. | `true` |
+| `EXPORT_INSTANCE_INFRA` | Set to `true` to include source infrastructure sizing (`instanceInfra` in `export_info.json.enc`). **Note:** `instanceInfra` is **only** used to upgrade Looker (Google Cloud core) infrastructure based on customer-hosted (On-Prem) capacity needs (never downgrading larger target instances); if not specified (`EXPORT_INSTANCE_INFRA=false`), the import lands on the default infrastructure that Looker (Google Cloud core) provides. | `true` |
 | `LOOKER_REPLICAS` | Optional cluster node/replica count recorded in `instanceInfra` for Looker (Google Cloud core) import tier upgrade (auto-detected from active `node` table heartbeats when unset). | *(auto)* |
 | `LOOKER_CPUS` | Optional per-node CPU count recorded in `instanceInfra` (auto-detected from host logical vCPUs when unset). | *(auto)* |
 | `LOOKER_MEMORY_GB` | Optional per-node memory in GiB recorded in `instanceInfra` (auto-detected from running Looker JVM `-Xmx` or host `MemTotal` when unset). | *(auto)* |
@@ -222,9 +222,9 @@ Upon successful completion, `looker_export.py` generates seven files in `${BACKU
 - `fs-handle`: Cloud KMS envelope-encrypted Tink keyset handle (DEK) for `fs-data`.
 - `mysql-data`: Tink Streaming AEAD-encrypted `.tar.gz` archive containing the Looker database export (`mysqldump` SQL dump or `mydumper` + `zstd` archive).
 - `mysql-handle`: Cloud KMS envelope-encrypted Tink keyset handle (DEK) for `mysql-data`.
-- `export_info.json.enc`: Tink Streaming AEAD-encrypted `ExportInfo` manifest containing source Looker infrastructure sizing (`instanceInfra` replicas, CPUs, memory, sanitized startup args) and `componentConfigs`.
+- `export_info.json.enc`: Tink Streaming AEAD-encrypted `ExportInfo` manifest containing `componentConfigs` and (when `EXPORT_INSTANCE_INFRA=true`) source Looker infrastructure sizing (`instanceInfra` replicas, CPUs, memory, sanitized startup args) — which is **only** used to upgrade Looker (Google Cloud core) infrastructure based on customer-hosted (On-Prem) capacity needs, landing on the default infrastructure Looker (Google Cloud core) provides if not specified.
 - `export_info-handle.enc`: Cloud KMS envelope-encrypted Tink keyset handle (DEK) for `export_info.json.enc`.
-- `metadata.json`: Export manifest containing the Looker instance identifier (`looker_instance`), detected Looker version (`looker_version`), canonical Cloud KMS CryptoKey resource (`export_encryption_key.cmek`), Cloud KMS-encrypted 32-byte Looker master key (`looker_encryption_key`), migration `source`, exported `file_paths`, `exportTime`, `exportMetrics` (component `sizeGb` and durations for `ALL`, `DB`, and `FS`), `componentConfigs`, and (when `EXPORT_INSTANCE_INFRA=true`) `instanceInfra` — which is **only** used to upgrade Looker (Google Cloud core) infrastructure based on customer-hosted (On-Prem) capacity needs, landing on the default infrastructure Looker (Google Cloud core) provides if not specified.
+- `metadata.json`: Export manifest containing the Looker instance identifier (`looker_instance`), detected Looker version (`looker_version`), canonical Cloud KMS CryptoKey resource (`export_encryption_key.cmek`), Cloud KMS-encrypted 32-byte Looker master key (`looker_encryption_key`), migration `source`, exported `file_paths`, `exportTime`, and `exportMetrics` (component `sizeGb`, `duration`, `retryCount`, `startTime`, and `endTime` for `ALL`, `DB`, and `FS`).
 
 All output artifacts are created with strict owner-only permissions (`0600`).
 
@@ -232,7 +232,7 @@ All output artifacts are created with strict owner-only permissions (`0600`).
 
 ## Next Steps: Import into Looker (Google Cloud core)
 
-1. Upload the five files inside `final_artifacts/` to a dedicated folder in a Google Cloud Storage bucket in the same region as your target Looker (Google Cloud core) instance:
+1. Upload all files inside `final_artifacts/` to a dedicated folder in a Google Cloud Storage bucket in the same region as your target Looker (Google Cloud core) instance:
    ```bash
    gcloud storage cp /mnt/backups/looker_export/final_artifacts/* gs://<your-migration-bucket>/<export-folder>/
    ```

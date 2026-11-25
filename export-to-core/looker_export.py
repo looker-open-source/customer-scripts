@@ -241,7 +241,7 @@ are used for unset secrets when attached to a terminal):
   DEBUG_LOG_ENABLED                                   (default: true)
   AUTO_CONFIRM                                        (default: false)
 
-Note on source infrastructure sizing (instanceInfra in metadata.json):
+Note on source infrastructure sizing (instanceInfra in export_info.json.enc):
   Source replica, CPU, and memory metadata is ONLY used to upgrade Looker
   (Google Cloud core) infrastructure based on On-Prem capacity needs (never
   downgrading a larger target instance). If not specified (for example,
@@ -2146,11 +2146,11 @@ class LookerExporter:
   def discover_source_infra(self) -> None:
     """Detects source Looker replica count, CPUs, memory, and startup flags.
 
-    Source infrastructure sizing (instanceInfra in metadata.json) is ONLY used
-    during import to upgrade Looker (Google Cloud core) infrastructure based on
-    On-Prem needs. If not specified (for example, EXPORT_INSTANCE_INFRA=false),
-    the imported instance lands on the default infrastructure that Looker Core
-    provides.
+    Source infrastructure sizing (instanceInfra in export_info.json.enc) is ONLY
+    used during import to upgrade Looker (Google Cloud core) infrastructure
+    based on On-Prem needs. If not specified (for example,
+    EXPORT_INSTANCE_INFRA=false), the imported instance lands on the default
+    infrastructure that Looker Core provides.
     """
     if self.export_instance_infra not in ('true', 'false'):
       self.preflight_fail(
@@ -3406,10 +3406,7 @@ class LookerExporter:
         ],
         'exportTime': export_time_us,
         'exportMetrics': self._build_export_metrics_payload(now_dt),
-        'componentConfigs': self._build_component_configs_payload(),
     }
-    if self.export_instance_infra == 'true':
-      metadata_payload['instanceInfra'] = self._build_instance_infra_payload()
     with open(out_meta, 'w', encoding='utf-8') as mf:
       json.dump(metadata_payload, mf, indent=2)
       mf.write('\n')
