@@ -531,6 +531,8 @@ class LookerExportUnitTest(unittest.TestCase):
   def test_discover_source_infra_and_sanitize_jvm_args(self):
     with tempfile.TemporaryDirectory() as tmpdir:
       exp = self.exp.LookerExporter(backup_arg=tmpdir)
+      self.assertEqual(exp.export_instance_infra, 'false')
+      exp.export_instance_infra = 'true'
       exp.db_connection_verified = True
       fake_ps = (
           'java -Xmx24g -Xms12g --db-password=topsecret '
@@ -561,6 +563,30 @@ class LookerExportUnitTest(unittest.TestCase):
       self.assertIn('--db-password=REDACTED', exp.detected_command_line_args)
       self.assertIn('-p REDACTED', exp.detected_command_line_args)
       self.assertIn('--clustered', exp.detected_command_line_args)
+
+      # Verify interactive optional prompt (skip vs opt-in).
+      exp_skip = self.exp.LookerExporter(backup_arg=tmpdir)
+      with (
+          mock.patch.object(self.exp.sys.stdin, 'isatty', return_value=True),
+          mock.patch.object(self.exp.sys.stdin, 'readline', return_value='\n'),
+      ):
+        exp_skip._prompt_optional_instance_infra()
+      self.assertEqual(exp_skip.export_instance_infra, 'false')
+
+      exp_opt_in = self.exp.LookerExporter(backup_arg=tmpdir)
+      with (
+          mock.patch.object(self.exp.sys.stdin, 'isatty', return_value=True),
+          mock.patch.object(
+              self.exp.sys.stdin,
+              'readline',
+              side_effect=['y\n', '2\n', '8\n', '32\n'],
+          ),
+      ):
+        exp_opt_in._prompt_optional_instance_infra()
+      self.assertEqual(exp_opt_in.export_instance_infra, 'true')
+      self.assertEqual(exp_opt_in.looker_replicas_override, '2')
+      self.assertEqual(exp_opt_in.looker_cpus_override, '8')
+      self.assertEqual(exp_opt_in.looker_memory_gb_override, '32')
 
 
 class CollectDiagnosticsTest(unittest.TestCase):
@@ -1050,13 +1076,17 @@ class LookerExportIntegrationTest(unittest.TestCase):
           'fs-handle',
           'mysql-data',
           'mysql-handle',
-          'export_info.json.enc',
-          'export_info-handle.enc',
           'metadata.json',
       ):
         artifact = os.path.join(final_dir, name)
         self.assertTrue(os.path.isfile(artifact), msg=f'Missing {name}')
         self.assertEqual(stat.S_IMODE(os.stat(artifact).st_mode), 0o600)
+      self.assertFalse(
+          os.path.exists(os.path.join(final_dir, 'export_info.json.enc'))
+      )
+      self.assertFalse(
+          os.path.exists(os.path.join(final_dir, 'export_info-handle.enc'))
+      )
 
       with open(
           os.path.join(final_dir, 'metadata.json'), encoding='utf-8'
@@ -1068,8 +1098,8 @@ class LookerExportIntegrationTest(unittest.TestCase):
           meta['export_encryption_key']['cmek'],
           'projects/p1/locations/us-central1/keyRings/r1/cryptoKeys/k1',
       )
-      self.assertIn('export_info.json.enc', meta['file_paths'])
-      self.assertIn('export_info-handle.enc', meta['file_paths'])
+      self.assertNotIn('export_info.json.enc', meta['file_paths'])
+      self.assertNotIn('export_info-handle.enc', meta['file_paths'])
       self.assertTrue(str(meta['exportTime']).isdigit())
       comp_by_type = {
           c['type']: c for c in meta['exportMetrics']['componentMetrics']
@@ -1079,20 +1109,6 @@ class LookerExportIntegrationTest(unittest.TestCase):
       self.assertTrue(comp_by_type['ALL']['duration'].endswith('s'))
       self.assertNotIn('instanceInfra', meta)
       self.assertNotIn('componentConfigs', meta)
-      with open(
-          os.path.join(final_dir, 'export_info.json.enc'), encoding='utf-8'
-      ) as eif:
-        export_info = json.load(eif)
-      self.assertEqual(
-          export_info['instanceInfra']['deploymentConfigs'][0]['replicas'], 3
-      )
-      self.assertEqual(
-          export_info['instanceInfra']['deploymentConfigs'][0]['type'], 'LOOKER'
-      )
-      self.assertEqual(
-          export_info['componentConfigs'][0]['exportType']['mysqlExportType'],
-          'MYSQLDUMP',
-      )
 
       with tarfile.open(os.path.join(final_dir, 'mysql-data'), 'r:gz') as tf:
         self.assertEqual(tf.getnames(), ['looker'])
@@ -1386,10 +1402,10 @@ class LookerExportIntegrationTest(unittest.TestCase):
           ['sudo', '-n', 'env', 'DEBIAN_FRONTEND=noninteractive'],
       )
 
-      # 3. Verify EXPORT_INSTANCE_INFRA=false omits instanceInfra so import
-      # lands on default Looker Core infrastructure.
+      # 3. Verify optional customer-supplied infra sizing generates
+      # export_info.json.enc + export_info-handle.enc when opted in.
       fx = self._create_hermetic_fixture(tmpdir)
-      bdir = os.path.join(tmpdir, 'backup_no_infra')
+      bdir = os.path.join(tmpdir, 'backup_with_infra')
       proc = subprocess.run(
           [sys.executable, LOOKER_EXPORT_PY],
           env={
@@ -1407,7 +1423,10 @@ class LookerExportIntegrationTest(unittest.TestCase):
               'KMS_KEY_NAME': (
                   'projects/p1/locations/us-central1/keyRings/r1/cryptoKeys/k1'
               ),
-              'EXPORT_INSTANCE_INFRA': 'false',
+              'EXPORT_INSTANCE_INFRA': 'true',
+              'LOOKER_REPLICAS': '3',
+              'LOOKER_CPUS': '12',
+              'LOOKER_MEMORY_GB': '32',
               'AUTO_CONFIRM': 'true',
           },
           check=False,
@@ -1415,10 +1434,6 @@ class LookerExportIntegrationTest(unittest.TestCase):
           text=True,
       )
       self.assertEqual(proc.returncode, 0, msg=proc.stderr)
-      self.assertIn(
-          'import will land on default Looker Core infra',
-          proc.stderr,
-      )
       with open(
           os.path.join(bdir, 'final_artifacts', 'metadata.json'),
           encoding='utf-8',
@@ -1426,13 +1441,22 @@ class LookerExportIntegrationTest(unittest.TestCase):
         meta = json.load(mf)
       self.assertNotIn('instanceInfra', meta)
       self.assertIn('exportMetrics', meta)
+      self.assertIn('export_info.json.enc', meta['file_paths'])
+      self.assertIn('export_info-handle.enc', meta['file_paths'])
       with open(
           os.path.join(bdir, 'final_artifacts', 'export_info.json.enc'),
           encoding='utf-8',
       ) as eif:
         export_info = json.load(eif)
-      self.assertNotIn('instanceInfra', export_info)
-      self.assertIn('componentConfigs', export_info)
+      looker_cfg = export_info['instanceInfra']['deploymentConfigs'][0]
+      self.assertEqual(looker_cfg['type'], 'LOOKER')
+      self.assertEqual(looker_cfg['replicas'], 3)
+      self.assertEqual(looker_cfg['cpus'], 12.0)
+      self.assertEqual(looker_cfg['memoryGb'], 32.0)
+      self.assertEqual(
+          export_info['componentConfigs'][0]['exportType']['mysqlExportType'],
+          'MYSQLDUMP',
+      )
 
 
 if __name__ == '__main__':

@@ -232,21 +232,23 @@ are used for unset secrets when attached to a terminal):
   EXCLUDE_MARKETPLACE                                 (default: false)
   DISABLE_SCHEDULED_PLANS                             (default: true)
   LOOKER_INSTANCE_ID                                  (default: onprem-export)
-  EXPORT_INSTANCE_INFRA                               (default: true)
-  LOOKER_REPLICAS          (optional override; auto-detected from node table)
-  LOOKER_CPUS              (optional override; auto-detected from host vCPUs)
-  LOOKER_MEMORY_GB         (optional override; auto-detected from JVM/RAM)
-  LOOKER_STARTUP_ARGS      (optional override; auto-detected from Looker JVM)
+  EXPORT_INSTANCE_INFRA       (optional; default: false; prompted in TTY)
+  LOOKER_REPLICAS       (optional Looker node count when upscaling; default: 1)
+  LOOKER_CPUS           (optional vCPUs per Looker node when upscaling)
+  LOOKER_MEMORY_GB      (optional GiB RAM per Looker node when upscaling)
+  LOOKER_STARTUP_ARGS   (optional Looker startup flags when upscaling)
   KEEP_INTERMEDIATE_FILES                             (default: false)
   DEBUG_LOG_ENABLED                                   (default: true)
   AUTO_CONFIRM                                        (default: false)
 
-Note on source infrastructure sizing (instanceInfra in export_info.json.enc):
-  Source replica, CPU, and memory metadata is ONLY used to upgrade Looker
-  (Google Cloud core) infrastructure based on On-Prem capacity needs (never
-  downgrading a larger target instance). If not specified (for example,
-  EXPORT_INSTANCE_INFRA=false), the import lands on the default infrastructure
-  that Looker (Google Cloud core) provides.
+Note on optional source infrastructure sizing (export_info.json.enc):
+  Providing source infrastructure sizing is completely optional (default:
+  EXPORT_INSTANCE_INFRA=false; prompted interactively when unset). When you opt
+  in, looker_export.py writes export_info.json.enc and export_info-handle.enc so
+  Looker (Google Cloud core) can upgrade target infrastructure based on your
+  source capacity needs (never downgrading a larger target instance). When
+  omitted, those two files are not generated and the import lands on the default
+  or existing infrastructure that Looker (Google Cloud core) provides.
 
 Cryptographic helper subcommands:
   ./looker_export.py <normalize-kms-key|test-kms|verify-kek>
@@ -827,9 +829,7 @@ class LookerExporter:
     self.looker_instance_id = (
         os.environ.get('LOOKER_INSTANCE_ID') or 'onprem-export'
     )
-    self.export_instance_infra = (
-        (os.environ.get('EXPORT_INSTANCE_INFRA') or 'true').strip().lower()
-    )
+    raw_export_infra = os.environ.get('EXPORT_INSTANCE_INFRA')
     self.looker_replicas_override = (
         os.environ.get('LOOKER_REPLICAS') or ''
     ).strip()
@@ -840,6 +840,20 @@ class LookerExporter:
     self.looker_startup_args_override = (
         os.environ.get('LOOKER_STARTUP_ARGS') or ''
     ).strip()
+    has_explicit_sizing = bool(
+        self.looker_replicas_override
+        or self.looker_cpus_override
+        or self.looker_memory_gb_override
+    )
+    self._export_instance_infra_explicit = bool(
+        (raw_export_infra and raw_export_infra.strip()) or has_explicit_sizing
+    )
+    if raw_export_infra and raw_export_infra.strip():
+      self.export_instance_infra = raw_export_infra.strip().lower()
+    elif has_explicit_sizing:
+      self.export_instance_infra = 'true'
+    else:
+      self.export_instance_infra = 'false'
 
     self.exclude_marketplace = os.environ.get('EXCLUDE_MARKETPLACE') or 'false'
     self.disable_scheduled_plans = (
@@ -1202,6 +1216,47 @@ class LookerExporter:
       os.environ[env_name] = secret_value
     return secret_value
 
+  def _prompt_line(self, prompt_text: str) -> str:
+    """Writes an interactive prompt to stderr and reads one line from stdin."""
+    sys.stderr.write(f'  [PROMPT] {prompt_text}')
+    sys.stderr.flush()
+    try:
+      return sys.stdin.readline().strip()
+    except OSError:
+      return ''
+
+  def _prompt_optional_instance_infra(self) -> None:
+    """Optionally asks interactive users for source Looker sizing to upscale."""
+    if self.auto_confirm == 'true' or not sys.stdin.isatty():
+      return
+    if not self._export_instance_infra_explicit:
+      reply = self._prompt_line(
+          'Optional: Provide source Looker node sizing (replicas, vCPUs, '
+          'memory GiB) so Looker Core can upscale target infrastructure '
+          'during import if needed? [y/N]: '
+      )
+      if not re.fullmatch(r'[Yy]([Ee][Ss])?', reply):
+        self.export_instance_infra = 'false'
+        return
+      self.export_instance_infra = 'true'
+      self._export_instance_infra_explicit = True
+
+    if self.export_instance_infra != 'true':
+      return
+    if not self.looker_replicas_override:
+      rep_ans = self._prompt_line(
+          'Enter source Looker node/replica count (LOOKER_REPLICAS) [1]: '
+      )
+      self.looker_replicas_override = rep_ans or '1'
+    if not self.looker_cpus_override:
+      self.looker_cpus_override = self._prompt_line(
+          'Enter vCPUs per Looker node (LOOKER_CPUS, e.g. 8): '
+      )
+    if not self.looker_memory_gb_override:
+      self.looker_memory_gb_override = self._prompt_line(
+          'Enter memory in GiB per Looker node (LOOKER_MEMORY_GB, e.g. 32): '
+      )
+
   def validate_environment(self) -> None:
     """Validates required input and secret environment variables."""
     self.mysql_pwd = self._prompt_secret_if_missing(
@@ -1215,6 +1270,7 @@ class LookerExporter:
     self.kms_key_name = self._prompt_secret_if_missing(
         self.kms_key_name, 'KMS_KEY_NAME', 'GCP Cloud KMS Key URI'
     )
+    self._prompt_optional_instance_infra()
 
     var_map = {
         'ON_PREM_LOOKER_DATA_PATH': self.on_prem_looker_data_path,
@@ -3297,21 +3353,20 @@ class LookerExporter:
     ]
 
   def generate_export_info(self) -> None:
-    """Encrypts ExportInfo (instanceInfra, replicas, componentConfigs)."""
+    """Encrypts optional ExportInfo when EXPORT_INSTANCE_INFRA=true."""
+    if self.export_instance_infra != 'true':
+      return
     out_data = os.path.join(self.final_artifacts_dir, EXPORT_INFO_FILE)
     out_handle = os.path.join(self.final_artifacts_dir, EXPORT_INFO_HANDLE_FILE)
     self.log_info(
-        f'Generating encrypted source infrastructure metadata '
+        f'Generating optional encrypted source infrastructure metadata '
         f'({EXPORT_INFO_FILE}, {EXPORT_INFO_HANDLE_FILE})...'
     )
     export_info_payload: dict[str, Any] = {
         'sourceInstance': self.looker_instance_id or 'onprem-export',
         'componentConfigs': self._build_component_configs_payload(),
+        'instanceInfra': self._build_instance_infra_payload(),
     }
-    if self.export_instance_infra == 'true':
-      export_info_payload['instanceInfra'] = (
-          self._build_instance_infra_payload()
-      )
     raw_bytes = (json.dumps(export_info_payload, indent=2) + '\n').encode(
         'utf-8'
     )
@@ -3388,6 +3443,15 @@ class LookerExporter:
     start_dt = self.export_start_dt or now_dt
     export_time_us = str(int(start_dt.timestamp() * 1_000_000))
 
+    file_paths = [
+        FS_DATA_FILE,
+        FS_HANDLE_FILE,
+        MYSQL_DATA_FILE,
+        MYSQL_HANDLE_FILE,
+    ]
+    if self.export_instance_infra == 'true':
+      file_paths.extend([EXPORT_INFO_FILE, EXPORT_INFO_HANDLE_FILE])
+
     metadata_payload: dict[str, Any] = {
         'looker_instance': self.looker_instance_id or 'onprem-export',
         'looker_version': self.detected_looker_version or 'unknown',
@@ -3396,14 +3460,7 @@ class LookerExporter:
         },
         'looker_encryption_key': encrypted_master_key,
         'source': 'LOOKER_ORIGINAL',
-        'file_paths': [
-            FS_DATA_FILE,
-            FS_HANDLE_FILE,
-            MYSQL_DATA_FILE,
-            MYSQL_HANDLE_FILE,
-            EXPORT_INFO_FILE,
-            EXPORT_INFO_HANDLE_FILE,
-        ],
+        'file_paths': file_paths,
         'exportTime': export_time_us,
         'exportMetrics': self._build_export_metrics_payload(now_dt),
     }
