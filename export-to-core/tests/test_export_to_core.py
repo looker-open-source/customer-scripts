@@ -564,6 +564,35 @@ class LookerExportUnitTest(unittest.TestCase):
       self.assertIn('-p REDACTED', exp.detected_command_line_args)
       self.assertIn('--clustered', exp.detected_command_line_args)
 
+      # Verify explicit LOOKER_MEMORY_GB override isn't inflated by host RAM.
+      exp.looker_memory_gb_override = '16'
+      with (
+          mock.patch.object(exp, '_detect_host_memory_gb', return_value=128.0),
+          mock.patch.object(
+              exp, '_detect_running_looker_jvm', return_value=(None, '')
+          ),
+      ):
+        exp.discover_source_infra()
+      self.assertEqual(exp.detected_memory_gb, 16.0)
+      self.assertEqual(exp.detected_limit_memory_gb, 16.0)
+
+      # Verify quoted sensitive values with spaces and malformed quotes.
+      quoted_sanitized = self.exp._sanitize_command_line_args(
+          '--port=9999 --password="my secret" --api-token \'two words\' '
+          '--log-dir="/var/log/my looker"'
+      )
+      self.assertNotIn('secret', quoted_sanitized)
+      self.assertNotIn('words', quoted_sanitized)
+      self.assertIn('--password=REDACTED', quoted_sanitized)
+      self.assertIn('--api-token REDACTED', quoted_sanitized)
+      self.assertIn("'--log-dir=/var/log/my looker'", quoted_sanitized)
+
+      unclosed_sanitized = self.exp._sanitize_command_line_args(
+          '--port=9999 --password="my secret'
+      )
+      self.assertNotIn('secret', unclosed_sanitized)
+      self.assertEqual(unclosed_sanitized, '--port=9999 --password=REDACTED')
+
       # Verify interactive optional prompt (skip vs opt-in).
       exp_skip = self.exp.LookerExporter(backup_arg=tmpdir)
       with (

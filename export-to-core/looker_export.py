@@ -29,6 +29,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -749,20 +750,45 @@ def _parse_jvm_xmx_gb(cmd_line: str) -> float | None:
   return round(amount * multipliers[unit], 2)
 
 
+def _has_unclosed_quote(val: str) -> str | None:
+  """Returns the opening quote char if val starts with an unclosed quote."""
+  if val and val[0] in ('"', "'") and (len(val) == 1 or val[-1] != val[0]):
+    return val[0]
+  return None
+
+
 def _sanitize_command_line_args(raw_args: str) -> str:
   """Redacts sensitive flag values from captured Looker startup arguments."""
-  tokens = raw_args.strip().split()
+  cleaned = raw_args.strip()
+  if not cleaned:
+    return ''
+  split_failed = False
+  try:
+    tokens = shlex.split(cleaned)
+  except ValueError:
+    split_failed = True
+    tokens = cleaned.split()
+
   sanitized: list[str] = []
   redact_next = False
+  skip_until_quote: str | None = None
   for tok in tokens:
+    if skip_until_quote is not None:
+      if skip_until_quote in tok:
+        skip_until_quote = None
+      continue
     if redact_next:
       sanitized.append('REDACTED')
       redact_next = False
+      if split_failed:
+        skip_until_quote = _has_unclosed_quote(tok)
       continue
     if '=' in tok:
-      flag_name, _ = tok.split('=', 1)
+      flag_name, flag_val = tok.split('=', 1)
       if _SENSITIVE_ARG_RE.search(flag_name):
         sanitized.append(f'{flag_name}=REDACTED')
+        if split_failed:
+          skip_until_quote = _has_unclosed_quote(flag_val)
         continue
     elif tok in ('-p', '--password') or (
         tok.startswith('-') and _SENSITIVE_ARG_RE.search(tok)
@@ -771,7 +797,7 @@ def _sanitize_command_line_args(raw_args: str) -> str:
       redact_next = True
       continue
     sanitized.append(tok)
-  return ' '.join(sanitized)
+  return ' '.join(sanitized) if split_failed else shlex.join(sanitized)
 
 
 def _format_rfc3339_utc(dt_val: datetime.datetime) -> str:
@@ -2275,9 +2301,11 @@ class LookerExporter:
     host_mem_gb = self._detect_host_memory_gb()
     jvm_xmx_gb, jvm_cmd_args = self._detect_running_looker_jvm()
     mem_gb = jvm_xmx_gb if jvm_xmx_gb is not None else host_mem_gb
+    memory_overridden = False
     if self.looker_memory_gb_override:
       try:
         mem_gb = max(0.1, float(self.looker_memory_gb_override))
+        memory_overridden = True
       except ValueError:
         self.preflight_warn(
             'Source Infrastructure',
@@ -2285,7 +2313,11 @@ class LookerExporter:
             f'using detected memory ({mem_gb} GiB).',
         )
     self.detected_memory_gb = round(mem_gb, 2)
-    self.detected_limit_memory_gb = round(max(host_mem_gb, mem_gb), 2)
+    self.detected_limit_memory_gb = (
+        round(mem_gb, 2)
+        if memory_overridden
+        else round(max(host_mem_gb, mem_gb), 2)
+    )
 
     if self.looker_startup_args_override:
       self.detected_command_line_args = _sanitize_command_line_args(
